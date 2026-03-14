@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_resolve_script() {
+  local s="$1"
+  while [[ -L "$s" ]]; do
+    local d; d="$(cd "$(dirname "$s")" && pwd -P)"
+    s="$(readlink "$s")"
+    [[ "$s" != /* ]] && s="$d/$s"
+  done
+  cd "$(dirname "$s")" && pwd -P
+}
+SCRIPT_DIR="$(_resolve_script "$0")"
+source "${SCRIPT_DIR}/lib/render.bash"
+
+PROVIDERS=(
+  aitop-codex
+  aitop-claude
+  aitop-gemini
+  aitop-opencode
+)
+
+usage() {
+  cat <<EOF
+Usage: aitop [--help]
+
+Run all usage providers in parallel and display results.
+
+Providers: ${PROVIDERS[*]}
+EOF
+}
+
+if [[ "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ -t 1 ]]; then
+  export CLICOLOR_FORCE=1
+fi
+
+setup_colors
+
+TEMP_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$TEMP_DIR"; }
+trap cleanup EXIT
+
+for provider in "${PROVIDERS[@]}"; do
+  script="${SCRIPT_DIR}/${provider}"
+  if [[ ! -x "$script" ]]; then
+    printf 'skip' > "${TEMP_DIR}/${provider}.status"
+    continue
+  fi
+  (
+    if "$script" > "${TEMP_DIR}/${provider}.out" 2> "${TEMP_DIR}/${provider}.err"; then
+      printf '0' > "${TEMP_DIR}/${provider}.status"
+    else
+      printf '%d' "$?" > "${TEMP_DIR}/${provider}.status"
+    fi
+  ) &
+done
+
+wait
+
+success_count=0
+fail_count=0
+skip_count=0
+
+for provider in "${PROVIDERS[@]}"; do
+  status="$(cat "${TEMP_DIR}/${provider}.status" 2>/dev/null || echo 'skip')"
+
+  if [[ "$status" == "skip" ]]; then
+    skip_count=$((skip_count + 1))
+    continue
+  fi
+
+  if [[ "$status" == "0" ]]; then
+    cat "${TEMP_DIR}/${provider}.out"
+    success_count=$((success_count + 1))
+  else
+    err="$(cat "${TEMP_DIR}/${provider}.err" 2>/dev/null || true)"
+    if [[ -t 1 ]]; then
+      printf '\033[2m[%s] %s\033[0m\n' "$provider" "${err:-failed}"
+    else
+      printf '[%s] %s\n' "$provider" "${err:-failed}"
+    fi
+    fail_count=$((fail_count + 1))
+  fi
+done
+
+if (( success_count == 0 && fail_count > 0 )); then
+  exit 1
+fi
+
+printf '\n'

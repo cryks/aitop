@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_resolve_script() {
+  local s="$1"
+  while [[ -L "$s" ]]; do
+    local d; d="$(cd "$(dirname "$s")" && pwd -P)"
+    s="$(readlink "$s")"
+    [[ "$s" != /* ]] && s="$d/$s"
+  done
+  cd "$(dirname "$s")" && pwd -P
+}
+SCRIPT_DIR="$(_resolve_script "$0")"
+source "${SCRIPT_DIR}/lib/render.bash"
+
+SETTINGS_FILE="${HOME}/.gemini/settings.json"
+CREDS_FILE="${HOME}/.gemini/oauth_creds.json"
+
+LOAD_URL="https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+QUOTA_URL="https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+TOKEN_URL="https://oauth2.googleapis.com/token"
+
+DAY_SECONDS=86400
+
+# Public upstream defaults from google-gemini/gemini-cli for installed-app OAuth.
+# These values are not user credentials or per-install secrets.
+DEFAULT_OAUTH_CLIENT_ID='681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com'
+DEFAULT_OAUTH_CLIENT_SECRET='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'
+
+SETTINGS_MISSING_MSG="Gemini CLI settings were not found. Log in with Gemini CLI first."
+SETTINGS_INVALID_MSG="Gemini CLI settings are invalid."
+AUTH_UNSUPPORTED_MSG="Gemini auth type is unsupported. Use Gemini CLI personal OAuth login."
+CRED_MISSING_MSG="Gemini CLI OAuth credentials were not found. Log in with Gemini CLI first."
+CRED_INVALID_MSG="Gemini CLI OAuth credentials are invalid."
+CRED_EXPIRED_MSG="Gemini OAuth token has expired. Re-authenticate in Gemini CLI."
+AUTH_REJECTED_MSG="Gemini OAuth token was rejected. Re-authenticate in Gemini CLI."
+NETWORK_ERR_MSG="Gemini usage fetch failed. Check network connectivity and try again."
+INVALID_USAGE_MSG="Gemini usage details were not present in the response."
+PROJECT_MISSING_MSG="Gemini project details were not present in the response."
+
+AUTH_REFRESH_RETRIED=0
+
+usage() {
+  cat <<'EOF'
+Usage: aitop-gemini [--help]
+
+Show the current Gemini usage summary for the
+local Gemini CLI OAuth login.
+
+Options:
+  --help  Show this help
+EOF
+}
+
+fail_stderr() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+cleanup_files() {
+  rm -f "${LOAD_FILE:-}" "${QUOTA_FILE:-}" "${REFRESH_FILE:-}"
+}
+
+validate_settings_file() {
+  if [[ ! -f "$SETTINGS_FILE" ]]; then
+    fail_stderr "$SETTINGS_MISSING_MSG"
+  fi
+
+  if ! jq -e . "$SETTINGS_FILE" >/dev/null 2>&1; then
+    fail_stderr "$SETTINGS_INVALID_MSG"
+  fi
+
+  AUTH_TYPE="$(jq -r '.security.auth.selectedType // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+  case "$AUTH_TYPE" in
+    ''|oauth-personal)
+      ;;
+    api-key|vertex-ai)
+      fail_stderr "$AUTH_UNSUPPORTED_MSG"
+      ;;
+  esac
+}
+
+validate_credentials_file() {
+  if [[ ! -f "$CREDS_FILE" ]]; then
+    fail_stderr "$CRED_MISSING_MSG"
+  fi
+
+  if ! jq -e . "$CREDS_FILE" >/dev/null 2>&1; then
+    fail_stderr "$CRED_INVALID_MSG"
+  fi
+
+  local credential_fields
+  credential_fields="$(jq -r '[.access_token // empty, .refresh_token // empty, .id_token // empty, (.expiry_date | tostring? // empty)] | @tsv' "$CREDS_FILE")" || fail_stderr "$CRED_INVALID_MSG"
+  IFS=$'\t' read -r ACCESS_TOKEN REFRESH_TOKEN ID_TOKEN EXPIRY_DATE <<<"$credential_fields"
+
+  if [[ -z "${ACCESS_TOKEN:-}" || -z "${EXPIRY_DATE:-}" || ! "$EXPIRY_DATE" =~ ^[0-9]+$ ]]; then
+    fail_stderr "$CRED_INVALID_MSG"
+  fi
+
+  if oauth_expired; then
+    refresh_oauth_credentials || fail_stderr "$CRED_EXPIRED_MSG"
+  fi
+}
+
+oauth_expired() {
+  local now_ms
+  now_ms=$(( $(date +%s) * 1000 ))
+  (( EXPIRY_DATE <= now_ms ))
+}
+
+resolve_oauth_js_path() {
+  local gemini_bin
+  gemini_bin="$(command -v gemini 2>/dev/null || true)"
+  [[ -n "$gemini_bin" ]] || return 0
+
+  while [[ -L "$gemini_bin" ]]; do
+    local link_dir target
+    link_dir="$(cd "$(dirname "$gemini_bin")" && pwd -P)"
+    target="$(readlink "$gemini_bin")"
+    [[ "$target" != /* ]] && target="$link_dir/$target"
+    gemini_bin="$target"
+  done
+
+  local candidate
+  candidate="$(dirname "$gemini_bin")/../libexec/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js"
+  if [[ -f "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  candidate="$(dirname "$gemini_bin")/../node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js"
+  if [[ -f "$candidate" ]]; then
+    printf '%s' "$candidate"
+  fi
+}
+
+resolve_oauth_secrets() {
+  OAUTH_CLIENT_ID="$DEFAULT_OAUTH_CLIENT_ID"
+  OAUTH_CLIENT_SECRET="$DEFAULT_OAUTH_CLIENT_SECRET"
+
+  local oauth_js_path
+  oauth_js_path="$(resolve_oauth_js_path)"
+  [[ -n "$oauth_js_path" && -f "$oauth_js_path" ]] || return 0
+
+  local extracted
+  extracted="$(python3 -c "import re, sys
+text = open(sys.argv[1]).read()
+client_id = re.search(r\"const OAUTH_CLIENT_ID = '([^']+)'\", text)
+client_secret = re.search(r\"const OAUTH_CLIENT_SECRET = '([^']+)'\", text)
+print((client_id.group(1) if client_id else '') + '\t' + (client_secret.group(1) if client_secret else ''))" "$oauth_js_path")"
+  local extracted_id extracted_secret
+  IFS=$'\t' read -r extracted_id extracted_secret <<<"$extracted"
+
+  [[ -n "$extracted_id" ]] && OAUTH_CLIENT_ID="$extracted_id"
+  [[ -n "$extracted_secret" ]] && OAUTH_CLIENT_SECRET="$extracted_secret"
+}
+
+request_json() {
+  local url="$1"
+  local payload="$2"
+  local out_file="$3"
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$out_file" -w '%{http_code}' "$url" \
+    -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json' \
+    --data "$payload")"; then
+    fail_stderr "$NETWORK_ERR_MSG"
+  fi
+
+  REQUEST_HTTP_CODE="$http_code"
+
+  if [[ "$REQUEST_HTTP_CODE" =~ ^(401|403)$ ]] && (( AUTH_REFRESH_RETRIED == 0 )); then
+    AUTH_REFRESH_RETRIED=1
+    refresh_oauth_credentials || fail_stderr "$AUTH_REJECTED_MSG"
+
+    if ! http_code="$(curl -sS --max-time 20 -o "$out_file" -w '%{http_code}' "$url" \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+      -H 'Content-Type: application/json' \
+      -H 'Accept: application/json' \
+      --data "$payload")"; then
+      fail_stderr "$NETWORK_ERR_MSG"
+    fi
+
+    REQUEST_HTTP_CODE="$http_code"
+  fi
+}
+
+refresh_oauth_credentials() {
+  [[ -n "${REFRESH_TOKEN:-}" ]] || return 1
+
+  resolve_oauth_secrets
+
+  REFRESH_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local form_body
+  form_body="$(python3 -c 'import sys, urllib.parse
+print(urllib.parse.urlencode({
+    "client_id": sys.argv[1],
+    "client_secret": sys.argv[2],
+    "refresh_token": sys.argv[3],
+    "grant_type": "refresh_token",
+}))' "$OAUTH_CLIENT_ID" "$OAUTH_CLIENT_SECRET" "$REFRESH_TOKEN")"
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$REFRESH_FILE" -w '%{http_code}' "$TOKEN_URL" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data "$form_body")"; then
+    fail_stderr "$NETWORK_ERR_MSG"
+  fi
+
+  case "$http_code" in
+    200)
+      ;;
+    400|401|403)
+      return 1
+      ;;
+    *)
+      fail_stderr "Gemini usage fetch failed. Unexpected status: ${http_code}."
+      ;;
+  esac
+
+  local refreshed_access refreshed_refresh refreshed_id expires_in new_expiry_date final_refresh_token
+  refreshed_access="$(jq -r '.access_token // empty' "$REFRESH_FILE" 2>/dev/null || true)"
+  refreshed_refresh="$(jq -r '.refresh_token // empty' "$REFRESH_FILE" 2>/dev/null || true)"
+  refreshed_id="$(jq -r '.id_token // empty' "$REFRESH_FILE" 2>/dev/null || true)"
+  expires_in="$(jq -r '(.expires_in | tonumber? // empty)' "$REFRESH_FILE" 2>/dev/null || true)"
+
+  if [[ -z "$refreshed_access" || -z "$expires_in" || ! "$expires_in" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  new_expiry_date=$(( $(date +%s) * 1000 + expires_in * 1000 ))
+  final_refresh_token="$REFRESH_TOKEN"
+  [[ -n "$refreshed_refresh" ]] && final_refresh_token="$refreshed_refresh"
+
+  python3 -c 'import json, sys
+path, access_token, refresh_token, id_token, expiry_date = sys.argv[1:6]
+data = json.load(open(path))
+data["access_token"] = access_token
+if refresh_token:
+    data["refresh_token"] = refresh_token
+if id_token:
+    data["id_token"] = id_token
+data["expiry_date"] = int(expiry_date)
+with open(path, "w") as fh:
+    json.dump(data, fh)
+ ' "$CREDS_FILE" "$refreshed_access" "$final_refresh_token" "$refreshed_id" "$new_expiry_date"
+
+  ACCESS_TOKEN="$refreshed_access"
+  REFRESH_TOKEN="$final_refresh_token"
+  [[ -n "$refreshed_id" ]] && ID_TOKEN="$refreshed_id"
+  EXPIRY_DATE="$new_expiry_date"
+}
+
+json_value_from_file() {
+  local file_path="$1"
+  local filter="$2"
+  jq -r "$filter // empty" "$file_path" 2>/dev/null || true
+}
+
+iso_to_epoch() {
+  local iso="$1"
+  local datetime
+  if [[ "$iso" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+    datetime="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+  TZ=UTC date -jf '%Y-%m-%dT%H:%M:%S' "$datetime" '+%s' 2>/dev/null
+}
+
+reset_after_seconds() {
+  local reset_at="$1"
+  [[ -n "$reset_at" ]] || return 0
+
+  local reset_epoch now_epoch
+  reset_epoch="$(iso_to_epoch "$reset_at")" || return 0
+  now_epoch="$(date +%s)"
+  local remaining=$(( reset_epoch - now_epoch ))
+  if (( remaining < 0 )); then
+    remaining=0
+  fi
+  printf '%s' "$remaining"
+}
+
+format_plan_name() {
+  local tier_id="$1"
+  case "$tier_id" in
+    standard-tier) printf 'paid' ;;
+    free-tier)     printf 'free' ;;
+    legacy-tier)   printf 'legacy' ;;
+    *)             printf '%s' "${tier_id:-unknown}" ;;
+  esac
+}
+
+select_bucket() {
+  local pattern="$1"
+  jq -c --arg pattern "$pattern" '[.buckets[]? | select(.modelId? != null and (.modelId | test($pattern)))] | sort_by((.remainingFraction // 1), (.resetTime // "")) | .[0] // empty' "$QUOTA_FILE" 2>/dev/null || true
+}
+
+bucket_used_percent() {
+  local bucket_json="$1"
+  [[ -n "$bucket_json" ]] || return 0
+
+  printf '%s' "$bucket_json" | python3 -c 'import json, sys
+bucket = json.load(sys.stdin)
+remaining = bucket.get("remainingFraction")
+if remaining is None:
+    raise SystemExit(0)
+used = max(0.0, min(100.0, (1.0 - float(remaining)) * 100.0))
+text = f"{used:.1f}".rstrip("0").rstrip(".")
+print(text)
+'
+}
+
+bucket_reset_at() {
+  local bucket_json="$1"
+  [[ -n "$bucket_json" ]] || return 0
+  printf '%s' "$bucket_json" | jq -r '.resetTime // empty' 2>/dev/null || true
+}
+
+window_summary() {
+  local label="$1"
+  local used_percent="$2"
+  local reset_at="$3"
+
+  [[ -n "$used_percent" ]] || return 0
+
+  local reset_after elapsed_pct=""
+  reset_after="$(reset_after_seconds "$reset_at")"
+  if [[ -n "$reset_after" && "$reset_after" =~ ^[0-9]+$ ]] && (( reset_after <= DAY_SECONDS )); then
+    local elapsed=$(( DAY_SECONDS - reset_after ))
+    elapsed_pct=$(( elapsed * 100 / DAY_SECONDS ))
+    if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  fi
+
+  render_window "$label" "$used_percent" "$elapsed_pct" "$reset_after" "$DAY_SECONDS"
+}
+
+fetch_load_code_assist() {
+  LOAD_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  request_json "$LOAD_URL" '{"metadata":{"ideType":"GEMINI_CLI","pluginType":"GEMINI"}}' "$LOAD_FILE"
+
+  case "$REQUEST_HTTP_CODE" in
+    200)
+      ;;
+    401|403)
+      fail_stderr "$AUTH_REJECTED_MSG"
+      ;;
+    *)
+      fail_stderr "Gemini usage fetch failed. Unexpected status: ${REQUEST_HTTP_CODE}."
+      ;;
+  esac
+}
+
+fetch_quota() {
+  QUOTA_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local payload='{}'
+  if [[ -n "${PROJECT_ID:-}" ]]; then
+    payload="$(python3 -c 'import json, sys; print(json.dumps({"project": sys.argv[1]}))' "$PROJECT_ID")"
+  fi
+
+  request_json "$QUOTA_URL" "$payload" "$QUOTA_FILE"
+
+  case "$REQUEST_HTTP_CODE" in
+    200)
+      ;;
+    401|403)
+      fail_stderr "$AUTH_REJECTED_MSG"
+      ;;
+    *)
+      fail_stderr "Gemini usage fetch failed. Unexpected status: ${REQUEST_HTTP_CODE}."
+      ;;
+  esac
+}
+
+print_usage_summary() {
+  local plan_name
+  plan_name="$(format_plan_name "$CURRENT_TIER_ID")"
+
+  local pro_bucket
+  pro_bucket="$(select_bucket '(^|-)pro($|-)')"
+
+  local pro_used pro_reset
+  pro_used="$(bucket_used_percent "$pro_bucket")"
+  pro_reset="$(bucket_reset_at "$pro_bucket")"
+
+  if [[ -z "$pro_used" ]]; then
+    printf '%s\n' "$INVALID_USAGE_MSG"
+    return
+  fi
+
+  render_provider_header "Gemini" 66 133 244 "$plan_name"
+  window_summary "Pro" "$pro_used" "$pro_reset"
+}
+
+main() {
+  if [[ $# -gt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  if [[ "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  if [[ $# -eq 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  setup_colors
+  validate_settings_file
+  validate_credentials_file
+  fetch_load_code_assist
+  CURRENT_TIER_ID="$(json_value_from_file "$LOAD_FILE" '.currentTier.id')"
+  PROJECT_ID="$(json_value_from_file "$LOAD_FILE" '.cloudaicompanionProject')"
+  if [[ "$CURRENT_TIER_ID" == "standard-tier" && -z "$PROJECT_ID" ]]; then
+    fail_stderr "$PROJECT_MISSING_MSG"
+  fi
+  fetch_quota
+  print_usage_summary
+}
+
+main "$@"

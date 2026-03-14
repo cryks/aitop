@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_resolve_script() {
+  local s="$1"
+  while [[ -L "$s" ]]; do
+    local d; d="$(cd "$(dirname "$s")" && pwd -P)"
+    s="$(readlink "$s")"
+    [[ "$s" != /* ]] && s="$d/$s"
+  done
+  cd "$(dirname "$s")" && pwd -P
+}
+SCRIPT_DIR="$(_resolve_script "$0")"
+source "${SCRIPT_DIR}/lib/render.bash"
+
+KEYCHAIN_SERVICE="Claude Code-credentials"
+USAGE_URL="https://api.anthropic.com/api/oauth/usage"
+BETA_HEADER="oauth-2025-04-20"
+
+FIVE_HOUR_SECONDS=18000
+SEVEN_DAY_SECONDS=604800
+
+CACHE_TTL_SECONDS="${CLAUDE_USAGE_CACHE_TTL:-300}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/aitop"
+CACHE_DB="${CLAUDE_USAGE_CACHE_DB:-${CACHE_DIR}/cache.db}"
+CACHE_KEY="aitop-claude"
+USE_CACHE="${CLAUDE_USAGE_CACHE:-1}"
+AUTH_REFRESH_RETRIED=0
+
+CRED_MISSING_MSG="Claude Code credentials not found in Keychain. Log in with Claude Code first."
+CRED_INVALID_MSG="Claude Code credentials are invalid."
+CRED_EXPIRED_MSG="Claude Code OAuth token has expired. Re-authenticate in Claude Code."
+NETWORK_ERR_MSG="Claude usage fetch failed. Check network connectivity and try again."
+AUTH_REJECTED_MSG="Claude OAuth token was rejected. Re-authenticate in Claude Code."
+INVALID_USAGE_MSG="Claude usage details were not present in the response."
+REFRESH_PROMPT="Reply with exactly: ok"
+
+usage() {
+  cat <<'EOF'
+Usage: aitop-claude [--help] [--no-cache]
+
+Show the current Claude Code usage summary for the
+local Claude OAuth login (macOS Keychain).
+
+Options:
+  --help      Show this help
+  --no-cache  Bypass the response cache
+EOF
+}
+
+fail_stderr() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+cleanup_files() {
+  rm -f "${BODY_FILE:-}"
+}
+
+# ── Time helpers ────────────────────────────────
+
+iso_to_epoch() {
+  local iso="$1"
+  local datetime
+  if [[ "$iso" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+    datetime="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+  TZ=UTC date -jf '%Y-%m-%dT%H:%M:%S' "$datetime" '+%s' 2>/dev/null
+}
+
+# ── Cache (SQLite3) ─────────────────────────────
+
+init_cache() {
+  (( USE_CACHE )) || return 0
+  mkdir -p "$CACHE_DIR"
+  sqlite3 "$CACHE_DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS cache (
+  key        TEXT PRIMARY KEY,
+  body       TEXT NOT NULL,
+  http_code  TEXT NOT NULL,
+  cached_at  INTEGER NOT NULL
+);
+SQL
+}
+
+# Try to read a cached response. Returns 0 on hit, 1 on miss.
+# On hit: writes body to BODY_FILE and sets HTTP_CODE.
+cache_get() {
+  (( USE_CACHE )) || return 1
+
+  local now
+  now="$(date +%s)"
+  local min_epoch=$(( now - CACHE_TTL_SECONDS ))
+
+  local row
+  row="$(sqlite3 -separator $'\t' "$CACHE_DB" \
+    "SELECT body, http_code FROM cache WHERE key = '${CACHE_KEY}' AND cached_at >= ${min_epoch} LIMIT 1;" 2>/dev/null)" || return 1
+
+  [[ -n "$row" ]] || return 1
+
+  BODY_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local cached_body cached_code
+  cached_code="${row##*$'\t'}"
+  cached_body="${row%$'\t'*}"
+
+  printf '%s' "$cached_body" > "$BODY_FILE"
+  HTTP_CODE="$cached_code"
+  return 0
+}
+
+# Store a response in the cache.
+cache_put() {
+  (( USE_CACHE )) || return 0
+
+  local body
+  body="$(cat "$BODY_FILE")"
+  local now
+  now="$(date +%s)"
+
+  # Use parameterised-style escaping: double single-quotes in body.
+  local escaped_body="${body//\'/\'\'}"
+
+  sqlite3 "$CACHE_DB" \
+    "INSERT OR REPLACE INTO cache (key, body, http_code, cached_at) VALUES ('${CACHE_KEY}', '${escaped_body}', '${HTTP_CODE}', ${now});" 2>/dev/null || true
+}
+
+# ── Auth ────────────────────────────────────────
+
+validate_credentials() {
+  local creds
+  creds="$(load_credentials)"
+
+  parse_credentials "$creds"
+
+  if oauth_expired; then
+    if refresh_oauth_credentials; then
+      creds="$(load_credentials)"
+      parse_credentials "$creds"
+    fi
+
+    if oauth_expired; then
+      fail_stderr "$CRED_EXPIRED_MSG"
+    fi
+  fi
+}
+
+load_credentials() {
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || fail_stderr "$CRED_MISSING_MSG"
+}
+
+parse_credentials() {
+  local creds="$1"
+  if ! printf '%s' "$creds" | jq -e '.claudeAiOauth' >/dev/null 2>&1; then
+    fail_stderr "$CRED_INVALID_MSG"
+  fi
+
+  local fields
+  fields="$(printf '%s' "$creds" | jq -r '[.claudeAiOauth.accessToken // empty, (.claudeAiOauth.expiresAt | tostring? // empty), .claudeAiOauth.subscriptionType // empty, .claudeAiOauth.rateLimitTier // empty] | @tsv')" || fail_stderr "$CRED_INVALID_MSG"
+  IFS=$'\t' read -r OAUTH_TOKEN OAUTH_EXPIRES SUBSCRIPTION_TYPE RATE_LIMIT_TIER <<<"$fields"
+
+  if [[ -z "${OAUTH_TOKEN:-}" ]]; then
+    fail_stderr "$CRED_INVALID_MSG"
+  fi
+}
+
+oauth_expired() {
+  [[ -n "${OAUTH_EXPIRES:-}" && "${OAUTH_EXPIRES:-}" =~ ^[0-9]+$ ]] || return 1
+
+  local now_ms
+  now_ms=$(( $(date +%s) * 1000 ))
+  (( OAUTH_EXPIRES <= now_ms ))
+}
+
+refresh_oauth_credentials() {
+  command -v claude >/dev/null 2>&1 || return 1
+  claude -p "$REFRESH_PROMPT" >/dev/null 2>&1
+}
+
+retry_with_refreshed_credentials() {
+  (( AUTH_REFRESH_RETRIED == 0 )) || return 1
+  AUTH_REFRESH_RETRIED=1
+
+  refresh_oauth_credentials || return 1
+
+  local creds
+  creds="$(load_credentials)"
+  parse_credentials "$creds"
+  oauth_expired && return 1
+
+  fetch_usage
+  handle_response
+  return 0
+}
+
+# ── Fetch ───────────────────────────────────────
+
+fetch_usage() {
+  if cache_get; then
+    return
+  fi
+
+  BODY_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$BODY_FILE" -w '%{http_code}' "$USAGE_URL" \
+    -H "Authorization: Bearer ${OAUTH_TOKEN}" \
+    -H 'Accept: application/json' \
+    -H "anthropic-beta: ${BETA_HEADER}" \
+    -H 'User-Agent: aitop-claude')"; then
+    fail_stderr "$NETWORK_ERR_MSG"
+  fi
+
+  HTTP_CODE="$http_code"
+
+  if [[ "$HTTP_CODE" == "200" ]]; then
+    cache_put
+  fi
+}
+
+json_value() {
+  local filter="$1"
+  jq -r "$filter // empty" "$BODY_FILE" 2>/dev/null || true
+}
+
+# ── Display ─────────────────────────────────────
+
+is_nonzero() {
+  local val="$1"
+  [[ -n "$val" && "$val" != "0" && "$val" != "0.0" ]]
+}
+
+window_summary() {
+  local label="$1"
+  local utilization="$2"
+  local resets_at="$3"
+  local window_seconds="$4"
+
+  [[ -n "$utilization" ]] || return 0
+
+  local reset_epoch="" now_epoch="" reset_after="" elapsed_pct=""
+  if [[ -n "$resets_at" ]]; then
+    reset_epoch="$(iso_to_epoch "$resets_at")" || true
+    if [[ -n "$reset_epoch" ]]; then
+      now_epoch="$(date +%s)"
+      reset_after=$(( reset_epoch - now_epoch ))
+      if (( reset_after < 0 )); then reset_after=0; fi
+    fi
+  fi
+
+  if [[ -n "$reset_after" && -n "$window_seconds" ]] && (( window_seconds > 0 && reset_after <= window_seconds )); then
+    local elapsed=$(( window_seconds - reset_after ))
+    elapsed_pct=$(( elapsed * 100 / window_seconds ))
+    if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  fi
+
+  render_window "$label" "$utilization" "$elapsed_pct" "$reset_after" "$window_seconds"
+}
+
+format_plan_name() {
+  local sub_type="$1"
+  local tier="$2"
+
+  case "$sub_type" in
+    max)
+      if [[ "$tier" == *"20x"* ]]; then
+        printf 'max (20x)'
+      elif [[ "$tier" == *"5x"* ]]; then
+        printf 'max (5x)'
+      else
+        printf 'max'
+      fi
+      ;;
+    pro)  printf 'pro' ;;
+    free) printf 'free' ;;
+    *)    printf '%s' "${sub_type:-unknown}" ;;
+  esac
+}
+
+print_usage_summary() {
+  local five_hour_util five_hour_reset
+  local seven_day_util seven_day_reset
+  local sonnet_util sonnet_reset
+  local opus_util opus_reset
+
+  five_hour_util="$(json_value '.five_hour.utilization')"
+  five_hour_reset="$(json_value '.five_hour.resets_at')"
+  seven_day_util="$(json_value '.seven_day.utilization')"
+  seven_day_reset="$(json_value '.seven_day.resets_at')"
+  sonnet_util="$(json_value '.seven_day_sonnet.utilization')"
+  sonnet_reset="$(json_value '.seven_day_sonnet.resets_at')"
+  opus_util="$(json_value '.seven_day_opus.utilization')"
+  opus_reset="$(json_value '.seven_day_opus.resets_at')"
+
+  if [[ -z "$five_hour_util" && -z "$seven_day_util" ]]; then
+    printf '%s\n' "$INVALID_USAGE_MSG"
+    return
+  fi
+
+  local plan_name
+  plan_name="$(format_plan_name "${SUBSCRIPTION_TYPE:-}" "${RATE_LIMIT_TIER:-}")"
+  local subtitle=""
+  if [[ -n "$plan_name" && "$plan_name" != "unknown" ]]; then
+    subtitle="$plan_name"
+  fi
+  render_provider_header "Claude" 217 119 87 "$subtitle"
+
+  window_summary "5-hour" "$five_hour_util" "$five_hour_reset" "$FIVE_HOUR_SECONDS"
+
+  if [[ -n "$seven_day_util" ]]; then
+    printf '\n'
+    window_summary "7-day" "$seven_day_util" "$seven_day_reset" "$SEVEN_DAY_SECONDS"
+  fi
+
+  if is_nonzero "${sonnet_util:-}"; then
+    printf '\n'
+    window_summary "7d sonnet" "$sonnet_util" "$sonnet_reset" "$SEVEN_DAY_SECONDS"
+  fi
+
+  if is_nonzero "${opus_util:-}"; then
+    printf '\n'
+    window_summary "7d opus" "$opus_util" "$opus_reset" "$SEVEN_DAY_SECONDS"
+  fi
+}
+
+handle_response() {
+  case "$HTTP_CODE" in
+    200)
+      print_usage_summary
+      ;;
+    401|403)
+      if retry_with_refreshed_credentials; then
+        return
+      fi
+      fail_stderr "$AUTH_REJECTED_MSG"
+      ;;
+    429)
+      fail_stderr "Claude usage API rate limited. Try again in a few minutes."
+      ;;
+    *)
+      fail_stderr "Claude usage fetch failed. Unexpected status: ${HTTP_CODE}."
+      ;;
+  esac
+}
+
+# ── Main ────────────────────────────────────────
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help)
+        usage
+        exit 0
+        ;;
+      --no-cache)
+        USE_CACHE=0
+        shift
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  setup_colors
+  init_cache
+  validate_credentials
+  fetch_usage
+  handle_response
+}
+
+main "$@"

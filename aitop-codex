@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_resolve_script() {
+  local s="$1"
+  while [[ -L "$s" ]]; do
+    local d; d="$(cd "$(dirname "$s")" && pwd -P)"
+    s="$(readlink "$s")"
+    [[ "$s" != /* ]] && s="$d/$s"
+  done
+  cd "$(dirname "$s")" && pwd -P
+}
+SCRIPT_DIR="$(_resolve_script "$0")"
+source "${SCRIPT_DIR}/lib/render.bash"
+
+AUTH_FILE="${HOME}/.local/share/opencode/auth.json"
+POOL_DB="${HOME}/.local/share/opencode/codex-pool.db"
+USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
+POOL_REFRESH_URL="https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID="app_EMoamEEZ73f0CkXaXp7hrann"
+
+AUTH_INVALID_MSG="OpenAI auth file is invalid."
+AUTH_INCOMPLETE_MSG="OpenAI auth entry is incomplete."
+AUTH_EXPIRED_MSG="OpenAI auth is missing or expired. Re-authenticate using the existing OpenCode login flow."
+AUTH_REJECTED_MSG="OpenAI auth was rejected by the Codex backend. Check account access, region support, or re-authenticate."
+NETWORK_ERR_MSG="Codex usage fetch failed. Check network connectivity and try again."
+INVALID_USAGE_MSG="Codex usage details were not present in the response."
+
+PRIMARY_ROWS=()
+SECONDARY_ROWS=()
+
+usage() {
+  cat <<'EOF'
+Usage: aitop-codex [--help]
+
+Show the current Codex usage summary for the local OpenCode
+ChatGPT/OpenAI login.
+
+Options:
+  --help  Show this help
+EOF
+}
+
+fail_stderr() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+cleanup_files() {
+  rm -f "${BODY_FILE:-}"
+}
+
+validate_auth_file() {
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    fail_stderr "$AUTH_EXPIRED_MSG"
+  fi
+
+  if ! jq -e . "$AUTH_FILE" >/dev/null 2>&1; then
+    fail_stderr "$AUTH_INVALID_MSG"
+  fi
+
+  local auth_fields
+  auth_fields="$(jq -r '[.openai.type // empty, .openai.access // empty, (.openai.expires | tostring? // empty), .openai.accountId // empty] | @tsv' "$AUTH_FILE")" || fail_stderr "$AUTH_INVALID_MSG"
+  IFS=$'\t' read -r OPENAI_TYPE OPENAI_ACCESS OPENAI_EXPIRES OPENAI_ACCOUNT_ID <<<"$auth_fields"
+
+  if [[ -z "${OPENAI_TYPE:-}" || -z "${OPENAI_ACCESS:-}" || -z "${OPENAI_EXPIRES:-}" || -z "${OPENAI_ACCOUNT_ID:-}" || "$OPENAI_TYPE" != "oauth" ]]; then
+    fail_stderr "$AUTH_INCOMPLETE_MSG"
+  fi
+
+  if [[ ! "$OPENAI_EXPIRES" =~ ^[0-9]+$ ]]; then
+    fail_stderr "$AUTH_INCOMPLETE_MSG"
+  fi
+
+  local now_ms
+  now_ms=$(( $(date +%s) * 1000 ))
+  if (( OPENAI_EXPIRES <= now_ms )); then
+    fail_stderr "$AUTH_EXPIRED_MSG"
+  fi
+}
+
+json_value() {
+  local body_file="$1"
+  local filter="$2"
+  jq -r "$filter // empty" "$body_file" 2>/dev/null || true
+}
+
+sql_quote() {
+  local value="$1"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "$value"
+}
+
+fetch_usage() {
+  local access_token="$1"
+  local account_id="$2"
+
+  BODY_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$BODY_FILE" -w '%{http_code}' "$USAGE_URL" -H "Authorization: Bearer ${access_token}" -H 'Accept: application/json' -H "ChatGPT-Account-Id: ${account_id}" -H 'User-Agent: aitop-codex')"; then
+    fail_stderr "$NETWORK_ERR_MSG"
+  fi
+
+  HTTP_CODE="$http_code"
+}
+
+refresh_pool_access() {
+  local pool_id="$1"
+  local refresh_token="$2"
+
+  BODY_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$BODY_FILE" -w '%{http_code}' "$POOL_REFRESH_URL" -H 'Accept: application/json' -H 'Content-Type: application/x-www-form-urlencoded' -H 'User-Agent: aitop-codex' --data-urlencode 'grant_type=refresh_token' --data-urlencode "refresh_token=${refresh_token}" --data-urlencode "client_id=${CODEX_CLIENT_ID}")"; then
+    cleanup_files
+    return 1
+  fi
+
+  if [[ "$http_code" != "200" ]]; then
+    cleanup_files
+    return 1
+  fi
+
+  REFRESHED_ACCESS="$(json_value "$BODY_FILE" '.access_token')"
+  REFRESHED_REFRESH="$(json_value "$BODY_FILE" '.refresh_token')"
+  local expires_in
+  expires_in="$(json_value "$BODY_FILE" '.expires_in')"
+
+  if [[ -z "$REFRESHED_ACCESS" || -z "$REFRESHED_REFRESH" || ! "$expires_in" =~ ^[0-9]+$ ]]; then
+    cleanup_files
+    return 1
+  fi
+
+  REFRESHED_EXPIRES=$(( $(date +%s) * 1000 + expires_in * 1000 ))
+
+  if [[ -f "$POOL_DB" ]]; then
+    local now_ms
+    now_ms=$(( $(date +%s) * 1000 ))
+    sqlite3 "$POOL_DB" "UPDATE account SET access_token = $(sql_quote "$REFRESHED_ACCESS"), refresh_token = $(sql_quote "$REFRESHED_REFRESH"), expires_at = ${REFRESHED_EXPIRES}, disabled_at = NULL, last_error = NULL, updated_at = ${now_ms} WHERE id = $(sql_quote "$pool_id");" >/dev/null 2>&1 || true
+  fi
+
+  cleanup_files
+  return 0
+}
+
+pool_account_rows() {
+  [[ -f "$POOL_DB" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+
+  sqlite3 -separator $'\t' "$POOL_DB" '
+    SELECT
+      id,
+      COALESCE(NULLIF(label, ""), NULLIF(email, ""), NULLIF(chatgpt_account_id, ""), id),
+      COALESCE(chatgpt_account_id, ""),
+      COALESCE(access_token, ""),
+      COALESCE(refresh_token, ""),
+      COALESCE(expires_at, 0)
+    FROM account
+    WHERE disabled_at IS NULL
+      AND primary_account = 0
+    ORDER BY priority ASC
+  ' 2>/dev/null || true
+}
+
+# ── Display ─────────────────────────────────────
+
+window_summary() {
+  local label="$1"
+  local used="$2"
+  local window_seconds="$3"
+  local reset_after="$4"
+
+  [[ -n "$used" || -n "$window_seconds" || -n "$reset_after" ]] || return 0
+
+  local elapsed_pct=""
+  if [[ -n "$window_seconds" && -n "$reset_after" ]] && (( window_seconds > 0 && reset_after <= window_seconds )); then
+    local elapsed=$(( window_seconds - reset_after ))
+    elapsed_pct=$(( elapsed * 100 / window_seconds ))
+    if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  fi
+
+  render_window "$label" "${used:-0}" "$elapsed_pct" "$reset_after" "$window_seconds"
+}
+
+print_usage_summary() {
+  local source="$1"
+  local label="$source"
+  local row
+
+  SUMMARY_PLAN_TYPE="$(json_value "$BODY_FILE" '.plan_type')"
+  SUMMARY_PRIMARY_USED="$(json_value "$BODY_FILE" '.rate_limit.primary_window.used_percent')"
+  SUMMARY_PRIMARY_WINDOW="$(json_value "$BODY_FILE" '.rate_limit.primary_window.limit_window_seconds')"
+  SUMMARY_PRIMARY_RESET_AFTER="$(json_value "$BODY_FILE" '.rate_limit.primary_window.reset_after_seconds')"
+  SUMMARY_SECONDARY_USED="$(json_value "$BODY_FILE" '.rate_limit.secondary_window.used_percent')"
+  SUMMARY_SECONDARY_WINDOW="$(json_value "$BODY_FILE" '.rate_limit.secondary_window.limit_window_seconds')"
+  SUMMARY_SECONDARY_RESET_AFTER="$(json_value "$BODY_FILE" '.rate_limit.secondary_window.reset_after_seconds')"
+
+  if [[ -n "$SUMMARY_PLAN_TYPE" ]]; then
+    label="$SUMMARY_PLAN_TYPE"
+  fi
+
+  if [[ -z "$SUMMARY_PRIMARY_USED" && -z "$SUMMARY_PRIMARY_WINDOW" && -z "$SUMMARY_PRIMARY_RESET_AFTER" && -z "$SUMMARY_SECONDARY_USED" && -z "$SUMMARY_SECONDARY_WINDOW" && -z "$SUMMARY_SECONDARY_RESET_AFTER" ]]; then
+    return 1
+  fi
+
+  if [[ -n "$SUMMARY_PRIMARY_USED" || -n "$SUMMARY_PRIMARY_WINDOW" || -n "$SUMMARY_PRIMARY_RESET_AFTER" ]]; then
+    row="${label}"$'\t'"${SUMMARY_PRIMARY_USED}"$'\t'"${SUMMARY_PRIMARY_WINDOW}"$'\t'"${SUMMARY_PRIMARY_RESET_AFTER}"
+    PRIMARY_ROWS+=("$row")
+  fi
+
+  if [[ -n "$SUMMARY_SECONDARY_USED" || -n "$SUMMARY_SECONDARY_WINDOW" || -n "$SUMMARY_SECONDARY_RESET_AFTER" ]]; then
+    row="${label}"$'\t'"${SUMMARY_SECONDARY_USED}"$'\t'"${SUMMARY_SECONDARY_WINDOW}"$'\t'"${SUMMARY_SECONDARY_RESET_AFTER}"
+    SECONDARY_ROWS+=("$row")
+  fi
+
+  return 0
+}
+
+handle_response() {
+  local source="$1"
+  local account_label="$2"
+  local strict_mode="1"
+
+  if [[ $# -ge 3 ]]; then
+    strict_mode="$3"
+  fi
+
+  case "$HTTP_CODE" in
+    200)
+      if ! print_usage_summary "$source" "$account_label"; then
+        if [[ "$strict_mode" == "1" ]]; then
+          printf '%s\n' "$INVALID_USAGE_MSG"
+          return 0
+        fi
+        return 1
+      fi
+      ;;
+    401|403)
+      if [[ "$strict_mode" == "1" ]]; then
+        fail_stderr "$AUTH_REJECTED_MSG"
+      fi
+      return 1
+      ;;
+    *)
+      if [[ "$strict_mode" == "1" ]]; then
+        fail_stderr "Codex usage fetch failed. Unexpected backend status: ${HTTP_CODE}."
+      fi
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+render_opencode_core_usage() {
+  fetch_usage "$OPENAI_ACCESS" "$OPENAI_ACCOUNT_ID"
+  handle_response "core" ""
+  cleanup_files
+}
+
+render_pool_account_usage() {
+  local pool_id="$1"
+  local pool_label="$2"
+  local pool_account_id="$3"
+  local pool_access="$4"
+  local pool_refresh="$5"
+  local pool_expires="$6"
+  local current_access="$pool_access"
+  local current_refresh="$pool_refresh"
+
+  [[ -n "$pool_account_id" && -n "$current_access" ]] || return 0
+
+  if [[ "$pool_account_id" == "$OPENAI_ACCOUNT_ID" || "$pool_id" == "$OPENAI_ACCOUNT_ID" ]]; then
+    return 0
+  fi
+
+  if [[ "$pool_expires" =~ ^[0-9]+$ ]] && (( pool_expires <= $(date +%s) * 1000 )); then
+    if refresh_pool_access "$pool_id" "$current_refresh"; then
+      current_access="$REFRESHED_ACCESS"
+      current_refresh="$REFRESHED_REFRESH"
+      pool_expires="$REFRESHED_EXPIRES"
+    fi
+  fi
+
+  if fetch_usage "$current_access" "$pool_account_id"; then
+    if handle_response "pool" "$pool_label" 0; then
+      cleanup_files
+      return 0
+    fi
+
+    if [[ "$HTTP_CODE" == "401" || "$HTTP_CODE" == "403" ]]; then
+      cleanup_files
+      if [[ -n "$current_refresh" ]] && refresh_pool_access "$pool_id" "$current_refresh"; then
+        current_access="$REFRESHED_ACCESS"
+        fetch_usage "$current_access" "$pool_account_id"
+        handle_response "pool" "$pool_label" 0 || true
+      fi
+    fi
+  fi
+
+  cleanup_files
+}
+
+render_pool_usage() {
+  local pool_id pool_label pool_account_id pool_access pool_refresh pool_expires
+
+  while IFS=$'\t' read -r pool_id pool_label pool_account_id pool_access pool_refresh pool_expires; do
+    [[ -n "$pool_id" ]] || continue
+    render_pool_account_usage "$pool_id" "$pool_label" "$pool_account_id" "$pool_access" "$pool_refresh" "$pool_expires"
+  done < <(pool_account_rows)
+}
+
+render_usage_section() {
+  local section_label="$1"
+  shift
+
+  [[ $# -gt 0 ]] || return 0
+
+  printf '    %b%s%b\n' "$C_BOLD" "$section_label" "$C_RESET"
+
+  local row label used window reset_after
+  for row in "$@"; do
+    IFS=$'\t' read -r label used window reset_after <<<"$row"
+    render_usage_row "$label" "$used" "$window" "$reset_after"
+  done
+}
+
+render_usage_row() {
+  local label="$1"
+  local used="$2"
+  local window_seconds="$3"
+  local reset_after="$4"
+
+  [[ -n "$used" || -n "$window_seconds" || -n "$reset_after" ]] || return 0
+
+  local elapsed_pct=""
+  if [[ -n "$window_seconds" && -n "$reset_after" ]] && (( window_seconds > 0 && reset_after <= window_seconds )); then
+    local elapsed=$(( window_seconds - reset_after ))
+    elapsed_pct=$(( elapsed * 100 / window_seconds ))
+    if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  fi
+
+  local usage_label elapsed_label window_label=""
+  usage_label="$(format_percent_label "$used")"
+
+  printf '    %-11s' "$label"
+  render_bar "$used"
+  printf ' %s%% used' "$usage_label"
+  if [[ -n "$elapsed_pct" ]]; then
+    printf '  '
+    pace_indicator "$used" "$elapsed_pct"
+  fi
+  printf '\n'
+
+  if [[ -n "$elapsed_pct" ]]; then
+    elapsed_label="$(format_percent_label "$elapsed_pct")"
+    if [[ -n "$window_seconds" && "$window_seconds" =~ ^[0-9]+$ ]] && (( window_seconds > 0 )); then
+      window_label="$(format_duration_seconds "$window_seconds")"
+    fi
+
+    printf '    %b%10s %b' "$C_DIM" "$window_label" "$C_RESET"
+    render_time_bar "$elapsed_pct"
+    printf ' %s%% elapsed' "$elapsed_label"
+    if [[ -n "$reset_after" && "$reset_after" =~ ^[0-9]+$ ]] && (( reset_after > 0 )); then
+      printf '%b · resets in %s%b' "$C_DIM" "$(format_reset_duration_seconds "$reset_after")" "$C_RESET"
+    fi
+    printf '\n'
+  else
+    local has_detail=""
+    if [[ -n "$window_seconds" && "$window_seconds" =~ ^[0-9]+$ ]] && (( window_seconds > 0 )); then
+      if [[ -z "$has_detail" ]]; then
+        printf '               %b' "$C_DIM"
+      fi
+      printf '%s window' "$(format_duration_seconds "$window_seconds")"
+      has_detail=1
+    fi
+    if [[ -n "$reset_after" && "$reset_after" =~ ^[0-9]+$ ]] && (( reset_after > 0 )); then
+      if [[ -z "$has_detail" ]]; then
+        printf '               %b' "$C_DIM"
+      else
+        printf ' · '
+      fi
+      printf 'resets in %s' "$(format_reset_duration_seconds "$reset_after")"
+      has_detail=1
+    fi
+    if [[ -n "$has_detail" ]]; then
+      printf '%b\n' "$C_RESET"
+    fi
+  fi
+}
+
+render_collected_usage() {
+  if (( ${#PRIMARY_ROWS[@]} == 0 && ${#SECONDARY_ROWS[@]} == 0 )); then
+    return 0
+  fi
+
+  render_provider_header "Codex" 16 163 127
+
+  render_usage_section "Primary" "${PRIMARY_ROWS[@]}"
+
+  if (( ${#SECONDARY_ROWS[@]} > 0 )); then
+    render_usage_section "Secondary" "${SECONDARY_ROWS[@]}"
+  fi
+}
+
+main() {
+  if [[ $# -gt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  if [[ "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  if [[ $# -eq 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  setup_colors
+  validate_auth_file
+  render_opencode_core_usage
+  render_pool_usage
+  render_collected_usage
+}
+
+main "$@"

@@ -1,0 +1,1104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_resolve_script() {
+  local s="$1"
+  while [[ -L "$s" ]]; do
+    local d; d="$(cd "$(dirname "$s")" && pwd -P)"
+    s="$(readlink "$s")"
+    [[ "$s" != /* ]] && s="$d/$s"
+  done
+  cd "$(dirname "$s")" && pwd -P
+}
+SCRIPT_DIR="$(_resolve_script "$0")"
+source "${SCRIPT_DIR}/lib/render.bash"
+
+COOKIE_FILE="${HOME}/.config/aitop-opencode/cookie"
+SERVER_URL="https://opencode.ai/_server"
+BASE_URL="https://opencode.ai"
+WORKSPACE_SERVER_ID="def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f"
+SUBSCRIPTION_SERVER_ID="7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4"
+COSTS_SERVER_ID="15702f3a12ff8bff357f8c2aa154a17e65b746d5f6b96adc9002c86ee0c15205"
+
+ROLLING_SECONDS=18000
+WEEKLY_SECONDS=604800
+MONTHLY_SECONDS=2592000
+
+COOKIE_MISSING_MSG="OpenCode cookie not found. Place your opencode.ai auth cookie in ${COOKIE_FILE} or set AITOP_OPENCODE_COOKIE."
+COOKIE_INVALID_MSG="OpenCode cookie is invalid. Ensure it contains an 'auth' cookie value."
+WORKSPACE_ERR_MSG="Failed to fetch OpenCode workspace. Check your cookie or network."
+USAGE_ERR_MSG="Failed to fetch OpenCode usage data."
+NETWORK_ERR_MSG="OpenCode request failed. Check network connectivity and try again."
+AUTH_REJECTED_MSG="OpenCode session cookie is invalid or expired. Update your cookie."
+INVALID_USAGE_MSG="OpenCode usage details were not present in the response."
+
+USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+
+usage() {
+  cat <<EOF
+Usage: aitop-opencode [--help]
+
+Show the current OpenCode usage summary and
+OpenCode Zen credit balance.
+
+Authentication:
+  Set the opencode.ai auth cookie via one of:
+    1. File:  ${COOKIE_FILE}
+    2. Env:   AITOP_OPENCODE_COOKIE
+
+  To get the cookie value, open opencode.ai in your browser,
+  open DevTools > Application > Cookies, and copy the value
+  of the 'auth' or '__Host-auth' cookie.
+
+Workspace:
+  Set AITOP_OPENCODE_WORKSPACE_ID to skip the dynamic workspace
+  fetch. Value should be wrk_... from your workspace URL.
+
+Options:
+  --help  Show this help
+EOF
+}
+
+fail_stderr() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+cleanup_files() {
+  rm -f "${BODY_FILE:-}" "${WORKSPACE_FILE:-}" "${BILLING_FILE:-}" "${COSTS_FILE:-}" "${WORKSPACE_PAGE_FILE:-}" "${GO_PAGE_FILE:-}" "${USAGE_PAGE_FILE:-}"
+}
+
+is_null_usage_payload() {
+  local body="$1"
+  local compact
+  compact="$(printf '%s' "$body" | tr -d '[:space:]')"
+
+  [[ -z "$compact" || "$compact" == "null" || "$compact" == '"null"' ]] && return 0
+
+  if [[ "$compact" =~ ^\;0x[0-9a-fA-F]+\;.*\[\],null\)$ ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+# ── Cookie ──────────────────────────────────────
+
+resolve_cookie() {
+  if [[ -n "${AITOP_OPENCODE_COOKIE:-}" ]]; then
+    COOKIE_HEADER="$AITOP_OPENCODE_COOKIE"
+    return
+  fi
+
+  if [[ -f "$COOKIE_FILE" ]]; then
+    COOKIE_HEADER="$(cat "$COOKIE_FILE")"
+    COOKIE_HEADER="${COOKIE_HEADER%%$'\n'*}"
+    if [[ -n "$COOKIE_HEADER" ]]; then
+      return
+    fi
+  fi
+
+  fail_stderr "$COOKIE_MISSING_MSG"
+}
+
+validate_cookie() {
+  if [[ "$COOKIE_HEADER" == *"auth="* ]] || [[ "$COOKIE_HEADER" == *"__Host-auth="* ]]; then
+    return
+  fi
+
+  local trimmed="${COOKIE_HEADER//[[:space:]]/}"
+  if [[ -n "$trimmed" && "$trimmed" != *"="* ]]; then
+    COOKIE_HEADER="auth=${COOKIE_HEADER}"
+    return
+  fi
+
+  fail_stderr "$COOKIE_INVALID_MSG"
+}
+
+# ── Fetch ───────────────────────────────────────
+
+fetch_server() {
+  local server_id="$1"
+  local args="${2:-}"
+  local referer="${3:-$BASE_URL}"
+  local out_file="$4"
+  local method="${5:-GET}"
+  local allow_retry_on_500="${6:-0}"
+
+  local url="$SERVER_URL"
+  if [[ "$method" == "GET" ]]; then
+    url="${SERVER_URL}?id=${server_id}"
+    if [[ -n "$args" ]]; then
+      local encoded_args
+      encoded_args="$(printf '%s' "$args" | python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read(),safe=""))')"
+      url="${url}&args=${encoded_args}"
+    fi
+  fi
+
+  local instance_id
+  instance_id="server-fn:$(uuidgen)"
+
+  local curl_args=(
+    -sS
+    --max-time 20
+    -o "$out_file"
+    -w '%{http_code}'
+    "$url"
+    -X "$method"
+    -H "Cookie: ${COOKIE_HEADER}"
+    -H "X-Server-Id: ${server_id}"
+    -H "X-Server-Instance: ${instance_id}"
+    -H "User-Agent: ${USER_AGENT}"
+    -H "Origin: ${BASE_URL}"
+    -H "Referer: ${referer}"
+    -H 'Accept: text/javascript, application/json;q=0.9, */*;q=0.8'
+  )
+
+  if [[ "$method" != "GET" && -n "$args" ]]; then
+    curl_args+=(
+      -H 'Content-Type: application/json'
+      --data "$args"
+    )
+  fi
+
+  local http_code
+  if ! http_code="$(curl "${curl_args[@]}")"; then
+    fail_stderr "$NETWORK_ERR_MSG"
+  fi
+
+  case "$http_code" in
+    200) ;;
+    401|403)
+      fail_stderr "$AUTH_REJECTED_MSG"
+      ;;
+    500)
+      if [[ "$allow_retry_on_500" == "1" ]]; then
+        return 2
+      fi
+      fail_stderr "OpenCode request failed. Unexpected status: ${http_code}."
+      ;;
+    *)
+      fail_stderr "OpenCode request failed. Unexpected status: ${http_code}."
+      ;;
+  esac
+}
+
+subscription_args() {
+  local workspace_id="$1"
+  printf '["%s"]' "$workspace_id"
+}
+
+costs_args() {
+  local workspace_id="$1"
+  local year month
+  year="$(date -u '+%Y')"
+  month="$(date -u '+%-m')"
+  month=$(( month - 1 ))
+  printf '["%s",%s,%s]' "$workspace_id" "$year" "$month"
+}
+
+resolve_workspace_id() {
+  if [[ -n "${AITOP_OPENCODE_WORKSPACE_ID:-}" ]]; then
+    WORKSPACE_ID="$AITOP_OPENCODE_WORKSPACE_ID"
+    return
+  fi
+  fetch_workspace_id
+}
+
+fetch_workspace_id() {
+  WORKSPACE_FILE="$(mktemp)"
+
+  if ! fetch_server "$WORKSPACE_SERVER_ID" "" "$BASE_URL" "$WORKSPACE_FILE" GET 1; then
+    fetch_server "$WORKSPACE_SERVER_ID" '[]' "$BASE_URL" "$WORKSPACE_FILE" POST
+  fi
+
+  local body
+  body="$(cat "$WORKSPACE_FILE")"
+
+  if printf '%s' "$body" | grep -qi 'sign in\|login\|auth/authorize'; then
+    fail_stderr "$AUTH_REJECTED_MSG"
+  fi
+
+  WORKSPACE_ID=""
+
+  if printf '%s' "$body" | jq -e '.' >/dev/null 2>&1; then
+    WORKSPACE_ID="$(printf '%s' "$body" | jq -r '.. | strings | select(startswith("wrk_"))' 2>/dev/null | head -1)"
+  fi
+
+  if [[ -z "$WORKSPACE_ID" ]]; then
+    WORKSPACE_ID="$(printf '%s' "$body" | grep -oE 'wrk_[A-Za-z0-9]+' | head -1)" || true
+  fi
+
+  if [[ -z "$WORKSPACE_ID" ]]; then
+    fetch_server "$WORKSPACE_SERVER_ID" '[]' "$BASE_URL" "$WORKSPACE_FILE" POST
+
+    body="$(cat "$WORKSPACE_FILE")"
+
+    if printf '%s' "$body" | grep -qi 'sign in\|login\|auth/authorize'; then
+      fail_stderr "$AUTH_REJECTED_MSG"
+    fi
+
+    WORKSPACE_ID="$(printf '%s' "$body" | grep -oE 'wrk_[A-Za-z0-9]+' | head -1)" || true
+  fi
+
+  if [[ -z "$WORKSPACE_ID" ]]; then
+    fail_stderr "$WORKSPACE_ERR_MSG"
+  fi
+}
+
+fetch_usage() {
+  BODY_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local args
+  args="$(subscription_args "$WORKSPACE_ID")"
+  local referer="${BASE_URL}/workspace/${WORKSPACE_ID}/billing"
+
+  if ! fetch_server "$SUBSCRIPTION_SERVER_ID" "$args" "$referer" "$BODY_FILE" GET 1; then
+    fetch_server "$SUBSCRIPTION_SERVER_ID" "$args" "$referer" "$BODY_FILE" POST
+  fi
+
+  local body
+  body="$(cat "$BODY_FILE")"
+
+  if is_null_usage_payload "$body"; then
+    return 1
+  fi
+
+  if ! printf '%s' "$body" | jq -e '.' >/dev/null 2>&1 && \
+    ! printf '%s' "$body" | grep -q 'rollingUsage'; then
+    if ! fetch_server "$SUBSCRIPTION_SERVER_ID" "$args" "$referer" "$BODY_FILE" POST 1; then
+      return 1
+    fi
+    body="$(cat "$BODY_FILE")"
+  fi
+
+  if is_null_usage_payload "$body"; then
+    return 1
+  fi
+
+  return 0
+}
+
+try_fetch_costs() {
+  COSTS_FILE="$(mktemp)"
+
+  local args
+  args="$(costs_args "$WORKSPACE_ID")"
+  local referer="${BASE_URL}/workspace/${WORKSPACE_ID}/usage"
+
+  if ! fetch_server "$COSTS_SERVER_ID" "$args" "$referer" "$COSTS_FILE" GET 1; then
+    rm -f "$COSTS_FILE"
+    COSTS_FILE=""
+    return 1
+  fi
+
+  return 0
+}
+
+try_fetch_billing() {
+  BILLING_FILE="$(mktemp)"
+
+  local url="${BASE_URL}/workspace/${WORKSPACE_ID}/billing"
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$BILLING_FILE" -w '%{http_code}' "$url" \
+    -H "Cookie: ${COOKIE_HEADER}" \
+    -H "User-Agent: ${USER_AGENT}" \
+    -H 'Accept: text/html')"; then
+    rm -f "$BILLING_FILE"
+    BILLING_FILE=""
+    return 1
+  fi
+
+  if [[ "$http_code" != "200" ]]; then
+    rm -f "$BILLING_FILE"
+    BILLING_FILE=""
+    return 1
+  fi
+
+  return 0
+}
+
+try_fetch_workspace_page() {
+  WORKSPACE_PAGE_FILE="$(mktemp)"
+
+  local url="${BASE_URL}/workspace/${WORKSPACE_ID}"
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$WORKSPACE_PAGE_FILE" -w '%{http_code}' "$url" \
+    -H "Cookie: ${COOKIE_HEADER}" \
+    -H "User-Agent: ${USER_AGENT}" \
+    -H 'Accept: text/html')"; then
+    rm -f "$WORKSPACE_PAGE_FILE"
+    WORKSPACE_PAGE_FILE=""
+    return 1
+  fi
+
+  if [[ "$http_code" != "200" ]]; then
+    rm -f "$WORKSPACE_PAGE_FILE"
+    WORKSPACE_PAGE_FILE=""
+    return 1
+  fi
+
+  return 0
+}
+
+try_fetch_go_page() {
+  GO_PAGE_FILE="$(mktemp)"
+
+  local url="${BASE_URL}/workspace/${WORKSPACE_ID}/go"
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$GO_PAGE_FILE" -w '%{http_code}' "$url" \
+    -H "Cookie: ${COOKIE_HEADER}" \
+    -H "User-Agent: ${USER_AGENT}" \
+    -H 'Accept: text/html')"; then
+    rm -f "$GO_PAGE_FILE"
+    GO_PAGE_FILE=""
+    return 1
+  fi
+
+  if [[ "$http_code" != "200" ]]; then
+    rm -f "$GO_PAGE_FILE"
+    GO_PAGE_FILE=""
+    return 1
+  fi
+
+  return 0
+}
+
+try_fetch_usage_page() {
+  USAGE_PAGE_FILE="$(mktemp)"
+
+  local url="${BASE_URL}/workspace/${WORKSPACE_ID}/usage"
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$USAGE_PAGE_FILE" -w '%{http_code}' "$url" \
+    -H "Cookie: ${COOKIE_HEADER}" \
+    -H "User-Agent: ${USER_AGENT}" \
+    -H 'Accept: text/html')"; then
+    rm -f "$USAGE_PAGE_FILE"
+    USAGE_PAGE_FILE=""
+    return 1
+  fi
+
+  if [[ "$http_code" != "200" ]]; then
+    rm -f "$USAGE_PAGE_FILE"
+    USAGE_PAGE_FILE=""
+    return 1
+  fi
+
+  return 0
+}
+
+# ── Parse ───────────────────────────────────────
+
+extract_usage() {
+  local body
+  body="$(cat "$BODY_FILE")"
+
+  ROLLING_PERCENT=""
+  ROLLING_RESET=""
+  WEEKLY_PERCENT=""
+  WEEKLY_RESET=""
+  MONTHLY_PERCENT=""
+  MONTHLY_RESET=""
+
+  if printf '%s' "$body" | jq -e '.' >/dev/null 2>&1; then
+    parse_json_usage "$body"
+  else
+    parse_seroval_usage "$body"
+  fi
+}
+
+parse_json_usage() {
+  local body="$1"
+
+  local rolling_key weekly_key monthly_key
+  for key in rollingUsage rolling rolling_usage rollingWindow rolling_window; do
+    if printf '%s' "$body" | jq -e ".. | objects | .${key} // empty" >/dev/null 2>&1; then
+      rolling_key="$key"
+      break
+    fi
+  done
+  for key in weeklyUsage weekly weekly_usage weeklyWindow weekly_window; do
+    if printf '%s' "$body" | jq -e ".. | objects | .${key} // empty" >/dev/null 2>&1; then
+      weekly_key="$key"
+      break
+    fi
+  done
+  for key in monthlyUsage monthly monthly_usage monthlyWindow monthly_window; do
+    if printf '%s' "$body" | jq -e ".. | objects | .${key} // empty" >/dev/null 2>&1; then
+      monthly_key="$key"
+      break
+    fi
+  done
+
+  if [[ -n "${rolling_key:-}" ]]; then
+    ROLLING_PERCENT="$(printf '%s' "$body" | jq -r "first(.. | objects | .${rolling_key} // empty | .usagePercent // .usedPercent // .percentUsed // .percent // .utilization // empty) | tostring" 2>/dev/null)" || true
+    ROLLING_RESET="$(printf '%s' "$body" | jq -r "first(.. | objects | .${rolling_key} // empty | .resetInSec // .resetInSeconds // .resetSeconds // empty) | tostring" 2>/dev/null)" || true
+  fi
+  if [[ -n "${weekly_key:-}" ]]; then
+    WEEKLY_PERCENT="$(printf '%s' "$body" | jq -r "first(.. | objects | .${weekly_key} // empty | .usagePercent // .usedPercent // .percentUsed // .percent // .utilization // empty) | tostring" 2>/dev/null)" || true
+    WEEKLY_RESET="$(printf '%s' "$body" | jq -r "first(.. | objects | .${weekly_key} // empty | .resetInSec // .resetInSeconds // .resetSeconds // empty) | tostring" 2>/dev/null)" || true
+  fi
+  if [[ -n "${monthly_key:-}" ]]; then
+    MONTHLY_PERCENT="$(printf '%s' "$body" | jq -r "first(.. | objects | .${monthly_key} // empty | .usagePercent // .usedPercent // .percentUsed // .percent // .utilization // empty) | tostring" 2>/dev/null)" || true
+    MONTHLY_RESET="$(printf '%s' "$body" | jq -r "first(.. | objects | .${monthly_key} // empty | .resetInSec // .resetInSeconds // .resetSeconds // empty) | tostring" 2>/dev/null)" || true
+  fi
+}
+
+parse_seroval_usage() {
+  local body="$1"
+
+  ROLLING_PERCENT="$(printf '%s' "$body" | grep -oE 'rollingUsage[^}]*usagePercent\s*:\s*([0-9]+(\.[0-9]+)?)' | grep -oE '[0-9]+(\.[0-9]+)?$' | head -1)" || true
+  ROLLING_RESET="$(printf '%s' "$body" | grep -oE 'rollingUsage[^}]*resetInSec\s*:\s*([0-9]+)' | grep -oE '[0-9]+$' | head -1)" || true
+  WEEKLY_PERCENT="$(printf '%s' "$body" | grep -oE 'weeklyUsage[^}]*usagePercent\s*:\s*([0-9]+(\.[0-9]+)?)' | grep -oE '[0-9]+(\.[0-9]+)?$' | head -1)" || true
+  WEEKLY_RESET="$(printf '%s' "$body" | grep -oE 'weeklyUsage[^}]*resetInSec\s*:\s*([0-9]+)' | grep -oE '[0-9]+$' | head -1)" || true
+  MONTHLY_PERCENT="$(printf '%s' "$body" | grep -oE 'monthlyUsage[^}]*usagePercent\s*:\s*([0-9]+(\.[0-9]+)?)' | grep -oE '[0-9]+(\.[0-9]+)?$' | head -1)" || true
+  MONTHLY_RESET="$(printf '%s' "$body" | grep -oE 'monthlyUsage[^}]*resetInSec\s*:\s*([0-9]+)' | grep -oE '[0-9]+$' | head -1)" || true
+}
+
+# ── Billing (Zen) ───────────────────────────────
+
+extract_billing() {
+  local body
+  body="$(cat "$BILLING_FILE")"
+
+  ZEN_BALANCE=""
+
+  # Extract balance from SSR'd HTML (seroval format: balance:NNNN)
+  ZEN_BALANCE="$(printf '%s' "$body" | grep -oE 'balance:[0-9]+' | head -1 | grep -oE '[0-9]+$')" || true
+}
+
+extract_billing_usage() {
+  local body
+  body="$(cat "$BILLING_FILE")"
+
+  if [[ -n "${MONTHLY_PERCENT:-}" && "${MONTHLY_PERCENT:-}" != "0" && "${MONTHLY_PERCENT:-}" != "0.0" && -n "${MONTHLY_RESET:-}" ]]; then
+    return 0
+  fi
+
+  local monthly_limit monthly_usage_raw
+  monthly_limit="$(printf '%s' "$body" | grep -oE 'monthlyLimit:[0-9]+(\.[0-9]+)?' | head -1 | grep -oE '[0-9]+(\.[0-9]+)?$')" || true
+  monthly_usage_raw="$(printf '%s' "$body" | grep -oE 'monthlyUsage:[0-9]+' | head -1 | grep -oE '[0-9]+$')" || true
+
+  if [[ -n "$monthly_limit" && -n "$monthly_usage_raw" ]]; then
+    MONTHLY_PERCENT="$(awk "BEGIN { printf \"%.1f\", (${monthly_usage_raw} / (${monthly_limit} * 100000000)) * 100 }")"
+    MONTHLY_RESET=""
+  fi
+}
+
+extract_go_page_usage() {
+  local body
+  body="$(cat "$GO_PAGE_FILE")"
+  parse_seroval_usage "$body"
+}
+
+extract_go_page_billing() {
+  local body
+  body="$(cat "$GO_PAGE_FILE")"
+
+  ZEN_BALANCE="$(printf '%s' "$body" | grep -oE 'balance:[0-9]+' | head -1 | grep -oE '[0-9]+$')" || true
+
+  if [[ -z "${MONTHLY_PERCENT:-}" || "${MONTHLY_PERCENT:-}" == "0" || "${MONTHLY_PERCENT:-}" == "0.0" ]]; then
+    local monthly_limit monthly_usage_raw
+    monthly_limit="$(printf '%s' "$body" | grep -oE 'monthlyLimit:[0-9]+(\.[0-9]+)?' | head -1 | grep -oE '[0-9]+(\.[0-9]+)?$')" || true
+    monthly_usage_raw="$(printf '%s' "$body" | grep -oE 'monthlyUsage:[0-9]+' | head -1 | grep -oE '[0-9]+$')" || true
+
+    if [[ -n "$monthly_limit" && -n "$monthly_usage_raw" ]]; then
+      MONTHLY_PERCENT="$(awk "BEGIN { printf \"%.1f\", (${monthly_usage_raw} / (${monthly_limit} * 100000000)) * 100 }")"
+      MONTHLY_RESET=""
+    fi
+  fi
+}
+
+extract_model_costs() {
+  local body
+  body="$(cat "$COSTS_FILE")"
+
+  GO_MODEL_COSTS_TODAY=""
+  GO_MODEL_COSTS_MONTH=""
+  ZEN_MODEL_COSTS_TODAY=""
+  ZEN_MODEL_COSTS_MONTH=""
+
+  local entries
+  entries="$(printf '%s' "$body" | grep -oE 'date:"[^"]+",model:"[^"]+",totalCost:[0-9]+,keyId:"[^"]+",plan:("[^"]+"|null)' || true)"
+  [[ -n "$entries" ]] || return 0
+
+  local today
+  today="$(date -u '+%Y-%m-%d')"
+
+  local today_go_data=""
+  local month_go_data=""
+  local today_zen_data=""
+  local month_zen_data=""
+
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+
+    local date_part model_part cost_part plan_part
+    local entry_date model raw_cost plan bucket
+    date_part="$(printf '%s' "$entry" | grep -oE 'date:"[^"]+"' | head -1)"
+    model_part="$(printf '%s' "$entry" | grep -oE 'model:"[^"]+"' | head -1)"
+    cost_part="$(printf '%s' "$entry" | grep -oE 'totalCost:[0-9]+' | head -1)"
+    plan_part="$(printf '%s' "$entry" | grep -oE 'plan:("[^"]+"|null)' | head -1)"
+
+    entry_date="${date_part#date:\"}"
+    entry_date="${entry_date%\"}"
+    model="${model_part#model:\"}"
+    model="${model%\"}"
+    raw_cost="${cost_part#totalCost:}"
+    if [[ "$plan_part" == 'plan:null' ]]; then
+      plan='null'
+    else
+      plan="${plan_part#plan:\"}"
+      plan="${plan%\"}"
+    fi
+
+    case "$plan" in
+      lite)
+        bucket="go"
+        ;;
+      null)
+        bucket="zen"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    if [[ "$bucket" == "go" ]]; then
+      month_go_data+="${raw_cost} ${model}"$'\n'
+      if [[ "$entry_date" == "$today" ]]; then
+        today_go_data+="${raw_cost} ${model}"$'\n'
+      fi
+    else
+      month_zen_data+="${raw_cost} ${model}"$'\n'
+      if [[ "$entry_date" == "$today" ]]; then
+        today_zen_data+="${raw_cost} ${model}"$'\n'
+      fi
+    fi
+  done <<< "$entries"
+
+  GO_MODEL_COSTS_TODAY="$(printf '%s' "$today_go_data" \
+    | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+    | sort -rn)" || true
+
+  GO_MODEL_COSTS_MONTH="$(printf '%s' "$month_go_data" \
+    | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+    | sort -rn)" || true
+
+  ZEN_MODEL_COSTS_TODAY="$(printf '%s' "$today_zen_data" \
+    | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+    | sort -rn)" || true
+
+  ZEN_MODEL_COSTS_MONTH="$(printf '%s' "$month_zen_data" \
+    | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+    | sort -rn)" || true
+}
+
+extract_workspace_usage_costs() {
+  local body
+  body="$(cat "$WORKSPACE_PAGE_FILE")"
+
+  local today current_month
+  today="$(date -u '+%Y-%m-%d')"
+  current_month="$(date -u '+%Y-%m')"
+
+  local extracted
+  extracted="$(printf '%s' "$body" | python3 -c '
+import re, sys
+html = sys.stdin.read()
+pattern = re.compile(r"id:\"usg_[^\"]+\".*?timeCreated:\\?\$R\[\d+\]=new Date\(\"([^\"]+)\"\).*?model:\"([^\"]+)\".*?cost:(\d+).*?enrichment:\\?\$R\[\d+\]=\{plan:\"([^\"]+)\"\}")
+for created, model, cost, plan in pattern.findall(html):
+    print(f"{created}\t{model}\t{cost}\t{plan}")
+')" || true
+
+  [[ -n "$extracted" ]] || return 0
+
+  local today_go_data=""
+  local month_go_data=""
+  local today_zen_data=""
+  local month_zen_data=""
+
+  while IFS=$'\t' read -r created model raw_cost plan; do
+    [[ -n "$created" && -n "$model" && -n "$raw_cost" ]] || continue
+
+    local entry_date entry_month bucket
+    entry_date="${created%%T*}"
+    entry_month="${entry_date%-*}"
+
+    case "$plan" in
+      lite)
+        bucket="go"
+        ;;
+      null)
+        bucket="zen"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    if [[ "$bucket" == "go" ]]; then
+      [[ "$entry_month" == "$current_month" ]] && month_go_data+="${raw_cost} ${model}"$'\n'
+      [[ "$entry_date" == "$today" ]] && today_go_data+="${raw_cost} ${model}"$'\n'
+    else
+      [[ "$entry_month" == "$current_month" ]] && month_zen_data+="${raw_cost} ${model}"$'\n'
+      [[ "$entry_date" == "$today" ]] && today_zen_data+="${raw_cost} ${model}"$'\n'
+    fi
+  done <<< "$extracted"
+
+  if [[ -n "$today_go_data" ]]; then
+    GO_MODEL_COSTS_TODAY="$(printf '%s' "$today_go_data" \
+      | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+      | sort -rn)" || true
+  fi
+
+  if [[ -n "$today_zen_data" ]]; then
+    ZEN_MODEL_COSTS_TODAY="$(printf '%s' "$today_zen_data" \
+      | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+      | sort -rn)" || true
+  fi
+
+  if [[ -n "$month_go_data" ]]; then
+    GO_MODEL_COSTS_MONTH="$(printf '%s' "$month_go_data" \
+      | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+      | sort -rn)" || true
+  fi
+
+  if [[ -n "$month_zen_data" ]]; then
+    ZEN_MODEL_COSTS_MONTH="$(printf '%s' "$month_zen_data" \
+      | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' \
+      | sort -rn)" || true
+  fi
+}
+
+extract_usage_page_costs() {
+  local body
+  body="$(cat "$USAGE_PAGE_FILE")"
+
+  GO_MODEL_COSTS_TODAY=""
+  GO_MODEL_COSTS_MONTH=""
+  ZEN_MODEL_COSTS_TODAY=""
+  ZEN_MODEL_COSTS_MONTH=""
+
+  local today current_month extracted
+  today="$(date -u '+%Y-%m-%d')"
+  current_month="$(date -u '+%Y-%m')"
+
+  extracted="$(printf '%s' "$body" | python3 -c '
+import re, sys
+html = sys.stdin.read()
+pattern = re.compile(r"id:\"usg_[^\"]+\".*?timeCreated:\\?\$R\[\d+\]=new Date\(\"([^\"]+)\"\).*?model:\"([^\"]+)\".*?cost:(\d+).*?enrichment:\\?\$R\[\d+\]=\{plan:(?:\"([^\"]+)\"|(null))\}")
+for created, model, cost, plan_string, plan_null in pattern.findall(html):
+    plan = plan_string or plan_null
+    print(f"{created}\t{model}\t{cost}\t{plan}")
+')" || true
+
+  [[ -n "$extracted" ]] || return 0
+
+  local today_go_data="" month_go_data="" today_zen_data="" month_zen_data=""
+
+  while IFS=$'\t' read -r created model raw_cost plan; do
+    [[ -n "$created" && -n "$model" && -n "$raw_cost" ]] || continue
+
+    local entry_date entry_month bucket
+    entry_date="${created%%T*}"
+    entry_month="${entry_date%-*}"
+
+    case "$plan" in
+      lite)
+        bucket="go"
+        ;;
+      null)
+        bucket="zen"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    if [[ "$bucket" == "go" ]]; then
+      [[ "$entry_month" == "$current_month" ]] && month_go_data+="${raw_cost} ${model}"$'\n'
+      [[ "$entry_date" == "$today" ]] && today_go_data+="${raw_cost} ${model}"$'\n'
+    else
+      [[ "$entry_month" == "$current_month" ]] && month_zen_data+="${raw_cost} ${model}"$'\n'
+      [[ "$entry_date" == "$today" ]] && today_zen_data+="${raw_cost} ${model}"$'\n'
+    fi
+  done <<< "$extracted"
+
+  [[ -z "$today_go_data" ]] || GO_MODEL_COSTS_TODAY="$(printf '%s' "$today_go_data" | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' | sort -rn)" || true
+  [[ -z "$month_go_data" ]] || GO_MODEL_COSTS_MONTH="$(printf '%s' "$month_go_data" | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' | sort -rn)" || true
+  [[ -z "$today_zen_data" ]] || ZEN_MODEL_COSTS_TODAY="$(printf '%s' "$today_zen_data" | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' | sort -rn)" || true
+  [[ -z "$month_zen_data" ]] || ZEN_MODEL_COSTS_MONTH="$(printf '%s' "$month_zen_data" | awk '{ totals[$2] += $1 } END { for (m in totals) print totals[m], m }' | sort -rn)" || true
+}
+
+format_cost_column() {
+  local data="$1"
+  [[ -n "$data" ]] || return 0
+
+  local total_raw=0
+  while IFS=' ' read -r raw_cost _model; do
+    [[ -n "$raw_cost" ]] || continue
+    total_raw=$(( total_raw + raw_cost ))
+  done <<< "$data"
+
+  while IFS=' ' read -r raw_cost model; do
+    [[ -n "$raw_cost" && -n "$model" ]] || continue
+    local cost_usd
+    cost_usd="$(format_usd "$raw_cost")"
+    [[ "$cost_usd" != "0.00" ]] || continue
+    printf '%-15s %7s\n' "$model" "\$${cost_usd}"
+  done <<< "$data"
+
+  printf '%-15s %7s\n' "total" "\$$(format_usd "$total_raw")"
+}
+
+sum_costs_raw() {
+  local data="$1"
+  local total_raw=0
+
+  [[ -n "$data" ]] || {
+    printf '0'
+    return 0
+  }
+
+  while IFS=' ' read -r raw_cost _model; do
+    [[ -n "$raw_cost" ]] || continue
+    total_raw=$(( total_raw + raw_cost ))
+  done <<< "$data"
+
+  printf '%s' "$total_raw"
+}
+
+format_plan_pair() {
+  local go_raw="$1"
+  local zen_raw="$2"
+  local go_value='-'
+  local zen_value='-'
+
+  if [[ -n "$go_raw" && "$go_raw" != "0" ]]; then
+    go_value="\$$(format_usd "$go_raw")"
+  fi
+
+  if [[ -n "$zen_raw" && "$zen_raw" != "0" ]]; then
+    zen_value="\$$(format_usd "$zen_raw")"
+  fi
+
+  printf '%b%6s%b/%6s' "$C_DIM" "$go_value" "$C_RESET" "$zen_value"
+}
+
+is_zero_cost() {
+  local raw="$1"
+  [[ -z "$raw" || "$raw" == "0" ]]
+}
+
+lookup_model_cost() {
+  local data="$1"
+  local model="$2"
+
+  [[ -n "$data" && -n "$model" ]] || return 0
+
+  while IFS=' ' read -r raw_cost row_model; do
+    [[ -n "$raw_cost" && -n "$row_model" ]] || continue
+    if [[ "$row_model" == "$model" ]]; then
+      printf '%s' "$raw_cost"
+      return 0
+    fi
+  done <<< "$data"
+}
+
+collect_models() {
+  local first="$1"
+  local second="$2"
+
+  printf '%s\n%s\n' "$first" "$second" \
+    | awk 'NF >= 2 { print $2 }' \
+    | awk '!seen[$0]++'
+}
+
+truncate_model_name() {
+  local model="$1"
+  local width="${2:-12}"
+
+  if (( ${#model} > width )); then
+    if (( width <= 3 )); then
+      printf '%.*s' "$width" "$model"
+    else
+      printf '%s...' "${model:0:$((width - 3))}"
+    fi
+    return 0
+  fi
+
+  printf '%s' "$model"
+}
+
+format_period_column() {
+  local go_data="$1"
+  local zen_data="$2"
+  local models model lines="" printed_lines=0
+  models="$(collect_models "$go_data" "$zen_data")"
+
+  while IFS= read -r model; do
+    [[ -n "$model" ]] || continue
+    local go_raw zen_raw pair display_model
+    go_raw="$(lookup_model_cost "$go_data" "$model")"
+    zen_raw="$(lookup_model_cost "$zen_data" "$model")"
+    if is_zero_cost "$go_raw" && is_zero_cost "$zen_raw"; then
+      continue
+    fi
+    pair="$(format_plan_pair "$go_raw" "$zen_raw")"
+    display_model="$(truncate_model_name "$model" 12)"
+    lines+="$(printf '%-12s %s' "$display_model" "$pair")"$'\n'
+    printed_lines=1
+  done <<< "$models"
+
+  if [[ "$printed_lines" == "1" ]]; then
+    lines+="$(printf '%-12s %s' "total" "$(format_plan_pair "$(sum_costs_raw "$go_data")" "$(sum_costs_raw "$zen_data")")")"
+  fi
+
+  printf '%s' "$lines"
+}
+
+format_balance_column() {
+  local zen_balance="$1"
+
+  [[ -n "$zen_balance" ]] || return 0
+
+  printf '%14s\n' "\$$(format_usd "$zen_balance")"
+}
+
+visible_text_length() {
+  local text="$1"
+  local plain
+  plain="$(printf '%s' "$text" | python3 -c 'import re,sys; print(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", sys.stdin.read()), end="")')"
+  printf '%s' "${#plain}"
+}
+
+print_visible_padded() {
+  local text="$1"
+  local width="$2"
+  local visible_len pad_len
+  visible_len="$(visible_text_length "$text")"
+  pad_len=$(( width - visible_len ))
+  (( pad_len < 0 )) && pad_len=0
+  printf '%s' "$text"
+  printf '%*s' "$pad_len" ''
+}
+
+max_visible_width() {
+  local text="$1"
+  local min_width="${2:-0}"
+  local max_width="$min_width"
+  local line line_width
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    line_width="$(visible_text_length "$line")"
+    (( line_width > max_width )) && max_width=$line_width
+  done <<< "$text"
+
+  printf '%s' "$max_width"
+}
+
+wrap_dim() {
+  local text="$1"
+  printf '%b%s%b' "$C_DIM" "$text" "$C_RESET"
+}
+
+format_section_header() {
+  local title="$1"
+  local value_label="$2"
+  local width="$3"
+  local title_width value_width
+  value_width="$(visible_text_length "$value_label")"
+  title_width=$(( width - value_width - 1 ))
+  (( title_width < ${#title} )) && title_width=${#title}
+  printf '%-*s %s' "$title_width" "$title" "$value_label"
+}
+
+print_model_costs() {
+  local zen_balance
+  zen_balance="${ZEN_BALANCE:-}"
+
+  [[ -n "${GO_MODEL_COSTS_TODAY:-}${GO_MODEL_COSTS_MONTH:-}${ZEN_MODEL_COSTS_TODAY:-}${ZEN_MODEL_COSTS_MONTH:-}${zen_balance}" ]] || return 0
+
+  local today_lines month_lines balance_lines
+  today_lines="$(format_period_column "${GO_MODEL_COSTS_TODAY:-}" "${ZEN_MODEL_COSTS_TODAY:-}")"
+  month_lines="$(format_period_column "${GO_MODEL_COSTS_MONTH:-}" "${ZEN_MODEL_COSTS_MONTH:-}")"
+  balance_lines="$(format_balance_column "$zen_balance")"
+
+  local today_w month_w balance_w balance_header_w gap
+  today_w="$(max_visible_width "$today_lines" 22)"
+  month_w="$(max_visible_width "$month_lines" 22)"
+  balance_w="$(max_visible_width "$balance_lines" 14)"
+  (( today_w < 20 )) && today_w=20
+  (( month_w < 20 )) && month_w=20
+  (( balance_w < 14 )) && balance_w=14
+  balance_header_w="$balance_w"
+  gap='    '
+
+  local today_count month_count balance_count max_lines
+  today_count="$(printf '%s\n' "$today_lines" | grep -c . || true)"
+  month_count="$(printf '%s\n' "$month_lines" | grep -c . || true)"
+  balance_count="$(printf '%s\n' "$balance_lines" | grep -c . || true)"
+  max_lines=$today_count
+  (( month_count > max_lines )) && max_lines=$month_count
+  (( balance_count > max_lines )) && max_lines=$balance_count
+
+  printf '\n'
+  printf '    '
+  print_visible_padded "$(wrap_dim "$(format_section_header 'Today' 'Go/   Zen' "$today_w")")" "$today_w"
+  printf '%s' "$gap"
+  print_visible_padded "$(wrap_dim "$(format_section_header 'This month' 'Go/   Zen' "$month_w")")" "$month_w"
+  printf '%s' "$gap"
+  print_visible_padded "$(wrap_dim "$(format_section_header '' 'Balance' "$balance_header_w")")" "$balance_header_w"
+  printf '\n'
+
+  local i=1
+  while (( i <= max_lines )); do
+    local today_line month_line balance_line
+    today_line="$(printf '%s\n' "$today_lines" | sed -n "${i}p")"
+    month_line="$(printf '%s\n' "$month_lines" | sed -n "${i}p")"
+    balance_line="$(printf '%s\n' "$balance_lines" | sed -n "${i}p")"
+
+    local today_is_total="" month_is_total=""
+    [[ "$today_line" != total* ]] || today_is_total=1
+    [[ "$month_line" != total* ]] || month_is_total=1
+
+    printf '    '
+    if [[ -n "$today_is_total" ]]; then
+      print_visible_padded "$(wrap_dim "$today_line")" "$today_w"
+    else
+      print_visible_padded "$today_line" "$today_w"
+    fi
+    printf '%s' "$gap"
+    if [[ -n "$month_is_total" ]]; then
+      print_visible_padded "$(wrap_dim "$month_line")" "$month_w"
+    else
+      print_visible_padded "$month_line" "$month_w"
+    fi
+    printf '%s' "$gap"
+    print_visible_padded "$balance_line" "$balance_w"
+    printf '\n'
+    i=$(( i + 1 ))
+  done
+}
+
+format_usd() {
+  local raw="${1:-0}"
+  if [[ ! "$raw" =~ ^-?[0-9]+$ ]]; then
+    printf '0.00'
+    return
+  fi
+  local result
+  result="$(awk "BEGIN { printf \"%.2f\", ${raw} / 100000000 }")"
+  if [[ "$result" == "-0.00" ]]; then
+    result="0.00"
+  fi
+  printf '%s' "$result"
+}
+
+# ── Display ─────────────────────────────────────
+
+is_nonzero() {
+  local val="$1"
+  [[ -n "$val" && "$val" != "0" && "$val" != "0.0" ]]
+}
+
+window_summary() {
+  local label="$1"
+  local used_percent="$2"
+  local reset_seconds="$3"
+  local window_seconds="$4"
+
+  [[ -n "$used_percent" ]] || return 0
+
+  local elapsed_pct=""
+  if [[ -n "$reset_seconds" && "$reset_seconds" =~ ^[0-9]+$ && -n "$window_seconds" ]] && (( window_seconds > 0 && reset_seconds <= window_seconds )); then
+    local elapsed=$(( window_seconds - reset_seconds ))
+    elapsed_pct=$(( elapsed * 100 / window_seconds ))
+    if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  fi
+
+  render_window "$label" "$used_percent" "$elapsed_pct" "$reset_seconds" "$window_seconds"
+}
+
+print_usage_summary() {
+  if [[ -z "${ROLLING_PERCENT:-}" && -z "${WEEKLY_PERCENT:-}" && -z "${MONTHLY_PERCENT:-}" ]]; then
+    printf '%s\n' "$INVALID_USAGE_MSG"
+    return
+  fi
+
+  render_provider_header "OpenCode" 59 130 246
+
+  if [[ -n "${ROLLING_PERCENT:-}" ]]; then
+    window_summary "5-hour" "$ROLLING_PERCENT" "$ROLLING_RESET" "$ROLLING_SECONDS"
+  fi
+
+  if [[ -n "${WEEKLY_PERCENT:-}" ]]; then
+    [[ -n "${ROLLING_PERCENT:-}" ]] && printf '\n'
+    window_summary "Weekly" "$WEEKLY_PERCENT" "$WEEKLY_RESET" "$WEEKLY_SECONDS"
+  fi
+
+  if is_nonzero "${MONTHLY_PERCENT:-}"; then
+    [[ -n "${ROLLING_PERCENT:-}${WEEKLY_PERCENT:-}" ]] && printf '\n'
+    window_summary "Monthly" "$MONTHLY_PERCENT" "$MONTHLY_RESET" "$MONTHLY_SECONDS"
+  fi
+}
+
+# ── Main ────────────────────────────────────────
+
+main() {
+  if [[ $# -gt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  if [[ "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  if [[ $# -eq 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  setup_colors
+  resolve_cookie
+  validate_cookie
+  resolve_workspace_id
+
+  if try_fetch_go_page; then
+    extract_go_page_usage
+    extract_go_page_billing
+  fi
+
+  if fetch_usage; then
+    extract_usage
+  fi
+
+  if try_fetch_billing; then
+    extract_billing
+    extract_billing_usage
+  fi
+
+  if try_fetch_usage_page; then
+    extract_usage_page_costs
+  fi
+
+  if try_fetch_costs; then
+    extract_model_costs
+  elif try_fetch_workspace_page; then
+    extract_workspace_usage_costs
+  fi
+
+  print_usage_summary
+  print_model_costs
+}
+
+main "$@"
