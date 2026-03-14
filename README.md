@@ -2,8 +2,6 @@
 
 Terminal dashboard that shows your AI coding assistant usage at a glance. Runs each provider in parallel and renders a unified view with color-coded usage bars, pacing indicators, and reset countdowns.
 
-## Screenshot
-
 ![aitop](docs/aitop.png)
 
 ## Supported Providers
@@ -73,30 +71,3 @@ Each provider renders a section with:
 
 OpenCode additionally shows per-model cost breakdowns (today / this month) and Zen credit balance.
 
-## Project Structure
-
-```
-aitop                 # Aggregator — runs all providers in parallel
-aitop-claude          # Claude Code usage via Anthropic OAuth API
-aitop-codex           # Codex usage via OpenAI/ChatGPT backend
-aitop-gemini          # Gemini CLI usage via Google Cloud Code Assist API
-aitop-opencode        # OpenCode usage via opencode.ai server functions
-lib/render.bash       # Shared terminal rendering (bars, colors, formatting)
-docs/                 # Screenshots and documentation assets
-tests/                # Contract tests per provider
-```
-
-## Tests
-
-Run the contract test for a specific provider:
-
-```bash
-bash tests/aitop-claude-contract.sh
-bash tests/aitop-codex-contract.sh
-bash tests/aitop-gemini-contract.sh
-bash tests/aitop-opencode-contract.sh
-```
-
-## License
-
-See repository for license details.
