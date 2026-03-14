@@ -2,6 +2,10 @@
 
 Terminal dashboard that shows your AI coding assistant usage at a glance. Runs each provider in parallel and renders a unified view with color-coded usage bars, pacing indicators, and reset countdowns.
 
+## Screenshot
+
+![aitop](docs/aitop.png)
+
 ## Supported Providers
 
 | Provider | Script | Auth Source |
@@ -78,6 +82,7 @@ aitop-codex           # Codex usage via OpenAI/ChatGPT backend
 aitop-gemini          # Gemini CLI usage via Google Cloud Code Assist API
 aitop-opencode        # OpenCode usage via opencode.ai server functions
 lib/render.bash       # Shared terminal rendering (bars, colors, formatting)
+docs/                 # Screenshots and documentation assets
 tests/                # Contract tests per provider
 ```
 
