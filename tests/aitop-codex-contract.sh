@@ -16,6 +16,8 @@ scenario_list=(
   incomplete-openai
   expired-token
   valid-auth-reaches-probe
+  valid-auth-without-account-id-reaches-probe
+  pool-dedupe-without-auth-account-id
   request-contract
   success-codex-headers
   success-with-pool-accounts
@@ -45,6 +47,7 @@ make_temp_home() {
 write_auth() {
   local home_dir="$1"
   local expires_ms="$2"
+  local account_id="${3:-acct-test}"
   cat > "$home_dir/.local/share/opencode/auth.json" <<EOF
 {
   "openai": {
@@ -52,7 +55,22 @@ write_auth() {
     "access": "test-access-token",
     "refresh": "test-refresh-token",
     "expires": ${expires_ms},
-    "accountId": "acct-test"
+    "accountId": "${account_id}"
+  }
+}
+EOF
+}
+
+write_auth_without_account_id() {
+  local home_dir="$1"
+  local expires_ms="$2"
+  cat > "$home_dir/.local/share/opencode/auth.json" <<EOF
+{
+  "openai": {
+    "type": "oauth",
+    "access": "test-access-token",
+    "refresh": "test-refresh-token",
+    "expires": ${expires_ms}
   }
 }
 EOF
@@ -61,6 +79,7 @@ EOF
 write_pool_db() {
   local home_dir="$1"
   local expires_ms="$2"
+  local account_id="${3:-acct-pool-1}"
   local db_path="$home_dir/.local/share/opencode/codex-pool.db"
 
   sqlite3 "$db_path" <<EOF
@@ -99,7 +118,7 @@ INSERT INTO account (
   'pool-1',
   NULL,
   'pool@example.com',
-  'acct-pool-1',
+  '${account_id}',
   NULL,
   1,
   0,
@@ -201,9 +220,15 @@ JSON
     ;;
   success-with-pool-accounts)
     case "$account_id_header" in
+      '')
+        cat > "$body_file" <<'JSON'
+{"account_id":"acct-test","plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":12.5,"limit_window_seconds":600,"reset_after_seconds":300},"secondary_window":{"used_percent":40.0,"limit_window_seconds":3600,"reset_after_seconds":1200}},"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}
+JSON
+        printf '200'
+        ;;
       'ChatGPT-Account-Id: acct-test')
         cat > "$body_file" <<'JSON'
-{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":12.5,"limit_window_seconds":600,"reset_after_seconds":300},"secondary_window":{"used_percent":40.0,"limit_window_seconds":3600,"reset_after_seconds":1200}},"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}
+{"account_id":"acct-test","plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":12.5,"limit_window_seconds":600,"reset_after_seconds":300},"secondary_window":{"used_percent":40.0,"limit_window_seconds":3600,"reset_after_seconds":1200}},"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}
 JSON
         printf '200'
         ;;
@@ -330,6 +355,20 @@ EOF
       assert_contains "$home_dir/curl-capture.txt" 'METHOD=GET'
       assert_contains "$home_dir/curl-capture.txt" 'AUTH_PRESENT=yes'
       assert_contains "$home_dir/curl-capture.txt" 'ACCOUNT_ID=ChatGPT-Account-Id: acct-test'
+      ;; 
+    valid-auth-without-account-id-reaches-probe)
+      write_auth_without_account_id "$home_dir" "$future_ms"
+      run_script "$home_dir" "success-codex-headers"
+      assert_contains "$home_dir/curl-capture.txt" 'METHOD=GET'
+      assert_contains "$home_dir/curl-capture.txt" 'AUTH_PRESENT=yes'
+      assert_contains "$home_dir/curl-capture.txt" 'ACCOUNT_ID='
+      ;;
+    pool-dedupe-without-auth-account-id)
+      write_auth_without_account_id "$home_dir" "$future_ms"
+      write_pool_db "$home_dir" "$future_ms" acct-test
+      run_script "$home_dir" "success-with-pool-accounts"
+      [[ "$(grep -c '^CALL=' "$home_dir/curl-capture.txt")" == "1" ]]
+      assert_contains "$home_dir/out.txt" 'pro        '
       ;;
     request-contract)
       write_auth "$home_dir" "$future_ms"

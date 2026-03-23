@@ -60,10 +60,10 @@ validate_auth_file() {
   fi
 
   local auth_fields
-  auth_fields="$(jq -r '[.openai.type // empty, .openai.access // empty, (.openai.expires | tostring? // empty), .openai.accountId // empty] | @tsv' "$AUTH_FILE")" || fail_stderr "$AUTH_INVALID_MSG"
+  auth_fields="$(jq -r '[.openai.type // empty, .openai.access // empty, (.openai.expires | tostring? // empty), (.openai.accountId // .openai.account_id // empty)] | @tsv' "$AUTH_FILE")" || fail_stderr "$AUTH_INVALID_MSG"
   IFS=$'\t' read -r OPENAI_TYPE OPENAI_ACCESS OPENAI_EXPIRES OPENAI_ACCOUNT_ID <<<"$auth_fields"
 
-  if [[ -z "${OPENAI_TYPE:-}" || -z "${OPENAI_ACCESS:-}" || -z "${OPENAI_EXPIRES:-}" || -z "${OPENAI_ACCOUNT_ID:-}" || "$OPENAI_TYPE" != "oauth" ]]; then
+  if [[ -z "${OPENAI_TYPE:-}" || -z "${OPENAI_ACCESS:-}" || -z "${OPENAI_EXPIRES:-}" || "$OPENAI_TYPE" != "oauth" ]]; then
     fail_stderr "$AUTH_INCOMPLETE_MSG"
   fi
 
@@ -98,7 +98,22 @@ fetch_usage() {
   trap cleanup_files EXIT
 
   local http_code
-  if ! http_code="$(curl -sS --max-time 20 -o "$BODY_FILE" -w '%{http_code}' "$USAGE_URL" -H "Authorization: Bearer ${access_token}" -H 'Accept: application/json' -H "ChatGPT-Account-Id: ${account_id}" -H 'User-Agent: aitop-codex')"; then
+  local curl_args=(
+    -sS
+    --max-time 20
+    -o "$BODY_FILE"
+    -w '%{http_code}'
+    "$USAGE_URL"
+    -H "Authorization: Bearer ${access_token}"
+    -H 'Accept: application/json'
+    -H 'User-Agent: aitop-codex'
+  )
+
+  if [[ -n "$account_id" ]]; then
+    curl_args+=( -H "ChatGPT-Account-Id: ${account_id}" )
+  fi
+
+  if ! http_code="$(curl "${curl_args[@]}")"; then
     fail_stderr "$NETWORK_ERR_MSG"
   fi
 
@@ -257,6 +272,11 @@ handle_response() {
 render_opencode_core_usage() {
   fetch_usage "$OPENAI_ACCESS" "$OPENAI_ACCOUNT_ID"
   handle_response "core" ""
+
+  if [[ -z "$OPENAI_ACCOUNT_ID" ]]; then
+    OPENAI_ACCOUNT_ID="$(json_value "$BODY_FILE" '.account_id')"
+  fi
+
   cleanup_files
 }
 
