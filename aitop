@@ -20,6 +20,22 @@ PROVIDERS=(
   aitop-opencode
 )
 
+# Check if a provider is enabled via environment variable.
+# Returns 0 (enabled) if the var is unset or not set to a false-like value.
+provider_enabled() {
+  local name="${1#aitop-}"  # strip aitop- prefix
+  # Convert to uppercase (portable, works on Bash 3+)
+  local var_name="AITOP_$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+  local value
+  value="$(eval echo "\${$var_name:-}")"
+
+  [[ -z "$value" ]] && return 0
+  case "$value" in
+    0|false|no|off|OFF|NO|FALSE) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 Usage: aitop [--help]
@@ -27,6 +43,9 @@ Usage: aitop [--help]
 Run all usage providers in parallel and display results.
 
 Providers: ${PROVIDERS[*]}
+
+Environment variables (set to 0/false/no/off to disable):
+  AITOP_CODEX, AITOP_CLAUDE, AITOP_GEMINI, AITOP_OPENCODE
 EOF
 }
 
@@ -46,6 +65,9 @@ cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT
 
 for provider in "${PROVIDERS[@]}"; do
+  if ! provider_enabled "$provider"; then
+    continue
+  fi
   script="${SCRIPT_DIR}/${provider}"
   if [[ ! -x "$script" ]]; then
     printf 'skip' > "${TEMP_DIR}/${provider}.status"
