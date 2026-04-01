@@ -256,6 +256,9 @@ window_summary() {
     local elapsed=$(( window_seconds - reset_after ))
     elapsed_pct=$(( elapsed * 100 / window_seconds ))
     if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  elif [[ -z "$reset_after" && -n "$window_seconds" ]] && (( window_seconds > 0 )); then
+    # Window not started yet — show 0% elapsed
+    elapsed_pct=0
   fi
 
   render_window "$label" "$utilization" "$elapsed_pct" "$reset_after" "$window_seconds"

@@ -335,6 +335,9 @@ window_summary() {
     local elapsed=$(( DAY_SECONDS - reset_after ))
     elapsed_pct=$(( elapsed * 100 / DAY_SECONDS ))
     if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  elif [[ -z "$reset_after" ]]; then
+    # Window not started yet — show 0% elapsed
+    elapsed_pct=0
   fi
 
   render_window "$label" "$used_percent" "$elapsed_pct" "$reset_after" "$DAY_SECONDS"
