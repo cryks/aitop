@@ -1,28 +1,23 @@
 # aitop
 
-Terminal dashboard that shows your AI coding assistant usage at a glance. Runs each provider in parallel and renders a unified view with color-coded usage bars, pacing indicators, and reset countdowns.
+Terminal dashboard for AI coding assistant usage. Runs providers in parallel and renders a unified view with color-coded bars, pacing indicators, and reset countdowns.
 
 ![aitop](docs/aitop.png)
 
-## Supported Providers
-
-| Provider | Script | Auth Source |
-|---|---|---|
-| Claude Code | `aitop-claude` | macOS Keychain (Claude Code OAuth) |
-| Codex | `aitop-codex` | `~/.local/share/opencode/auth.json` |
-| Gemini CLI | `aitop-gemini` | `~/.gemini/oauth_creds.json` |
-| OpenCode | `aitop-opencode` | Cookie file or `AITOP_OPENCODE_COOKIE` env var |
+---
 
 ## Requirements
 
 - Bash 4+
 - `jq`
 - `curl`
-- `sqlite3` (for Claude caching and Codex pool accounts)
-- `python3` (for Gemini token refresh and OpenCode parsing)
-- macOS (`security` command for Claude Keychain access, BSD `date -jf` for timestamp parsing)
+- `sqlite3` (Claude caching and Codex pool accounts)
+- `python3` (Gemini token refresh and OpenCode parsing)
+- macOS (`security` command for Claude Keychain access)
 
-## Usage
+---
+
+## Quick Start
 
 Run all providers:
 
@@ -39,28 +34,82 @@ aitop-gemini
 aitop-opencode
 ```
 
-Each script accepts `--help` for provider-specific options.
+---
 
-### Provider-Specific Options
+## Supported Providers
 
-**aitop-claude**
+| Provider | Script | Auth Source |
+|----------|--------|-------------|
+| Claude Code | `aitop-claude` | macOS Keychain (Claude Code OAuth) |
+| Codex | `aitop-codex` | `~/.local/share/opencode/auth.json` |
+| Gemini CLI | `aitop-gemini` | `~/.gemini/oauth_creds.json` |
+| OpenCode | `aitop-opencode` | Cookie file or `AITOP_OPENCODE_COOKIE` env |
 
+---
+
+## Configure Providers
+
+### Claude Code
+
+Requires an active Claude Code login on macOS. Credentials are read from the macOS Keychain.
+
+Environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `CLAUDE_USAGE_CACHE_TTL` | Cache TTL in seconds (default: 300) |
+| `CLAUDE_USAGE_CACHE` | Set to `0` to disable caching |
+
+Options:
+
+```bash
+aitop-claude --no-cache    # Bypass response cache
 ```
---no-cache    Bypass the response cache (default TTL: 5 min)
-```
 
-Cache TTL is configurable via `CLAUDE_USAGE_CACHE_TTL` (seconds). Set `CLAUDE_USAGE_CACHE=0` to disable caching entirely.
+### Codex
 
-**aitop-opencode**
+Requires an active OpenCode login. Reads auth from `~/.local/share/opencode/auth.json`.
 
-Requires a browser auth cookie. Set it via:
+Supports pool accounts via `~/.local/share/opencode/codex-pool.db`.
+
+### Gemini CLI
+
+Requires an active Gemini CLI OAuth login. Reads credentials from `~/.gemini/oauth_creds.json`.
+
+### OpenCode
+
+Requires a browser auth cookie from opencode.ai.
+
+Set the cookie via one of:
 
 1. File: `~/.config/aitop-opencode/cookie`
 2. Environment: `AITOP_OPENCODE_COOKIE`
 
-Set `AITOP_OPENCODE_WORKSPACE_ID` to skip dynamic workspace discovery.
+To get the cookie value, open opencode.ai in your browser, open DevTools > Application > Cookies, and copy the value of the `auth` or `__Host-auth` cookie.
 
-## Output
+Environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `AITOP_OPENCODE_COOKIE` | Auth cookie value |
+| `AITOP_OPENCODE_WORKSPACE_ID` | Skip workspace discovery (format: `wrk_...`) |
+
+---
+
+## Disable Providers
+
+Set environment variables to `0`, `false`, `no`, or `off` to disable specific providers when running `aitop`:
+
+```bash
+export AITOP_CLAUDE=0      # Disable Claude
+export AITOP_CODEX=0       # Disable Codex
+export AITOP_GEMINI=0      # Disable Gemini
+export AITOP_OPENCODE=0    # Disable OpenCode
+```
+
+---
+
+## Output Format
 
 Each provider renders a section with:
 
