@@ -16,6 +16,7 @@ source "${SCRIPT_DIR}/lib/render.bash"
 PROVIDERS=(
   aitop-codex
   aitop-claude
+  aitop-copilot
   aitop-gemini
   aitop-opencode
 )
@@ -45,7 +46,7 @@ Run all usage providers in parallel and display results.
 Providers: ${PROVIDERS[*]}
 
 Environment variables (set to 0/false/no/off to disable):
-  AITOP_CODEX, AITOP_CLAUDE, AITOP_GEMINI, AITOP_OPENCODE
+  AITOP_CODEX, AITOP_CLAUDE, AITOP_COPILOT, AITOP_GEMINI, AITOP_OPENCODE
 EOF
 }
 

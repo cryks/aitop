@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_resolve_script() {
+  local s="$1"
+  while [[ -L "$s" ]]; do
+    local d; d="$(cd "$(dirname "$s")" && pwd -P)"
+    s="$(readlink "$s")"
+    [[ "$s" != /* ]] && s="$d/$s"
+  done
+  cd "$(dirname "$s")" && pwd -P
+}
+SCRIPT_DIR="$(_resolve_script "$0")"
+source "${SCRIPT_DIR}/lib/render.bash"
+
+KEYCHAIN_SERVICE="github-copilot"
+USAGE_URL="https://api.github.com/copilot_internal/user"
+
+CACHE_TTL_SECONDS="${COPILOT_USAGE_CACHE_TTL:-300}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/aitop"
+CACHE_DB="${COPILOT_USAGE_CACHE_DB:-${CACHE_DIR}/cache.db}"
+CACHE_KEY="aitop-copilot"
+USE_CACHE="${COPILOT_USAGE_CACHE:-1}"
+
+CRED_MISSING_MSG="GitHub Copilot token not found. Set AITOP_COPILOT_TOKEN environment variable, or authenticate with GitHub Copilot first."
+CRED_INVALID_MSG="GitHub Copilot token is invalid."
+NETWORK_ERR_MSG="GitHub Copilot usage fetch failed. Check network connectivity and try again."
+AUTH_REJECTED_MSG="GitHub Copilot token was rejected. Re-authenticate or check token permissions."
+INVALID_USAGE_MSG="GitHub Copilot usage details were not present in the response."
+
+DEBUG=0
+
+usage() {
+  cat <<'EOF'
+Usage: aitop-copilot [--help] [--no-cache] [--debug]
+
+Show the current GitHub Copilot usage summary.
+
+The token is read from (in order):
+  1. AITOP_COPILOT_TOKEN environment variable (recommended)
+  2. GITHUB_TOKEN environment variable
+  3. GITHUB_COPILOT_TOKEN environment variable
+  4. macOS Keychain (github-copilot service)
+
+Options:
+  --help      Show this help
+  --no-cache  Bypass the response cache
+  --debug     Show raw API response for troubleshooting
+EOF
+}
+
+fail_stderr() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+cleanup_files() {
+  rm -f "${BODY_FILE:-}"
+}
+
+# ── Cache (SQLite3) ─────────────────────────────
+
+init_cache() {
+  (( USE_CACHE )) || return 0
+  mkdir -p "$CACHE_DIR"
+  sqlite3 "$CACHE_DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS cache (
+  key        TEXT PRIMARY KEY,
+  body       TEXT NOT NULL,
+  http_code  TEXT NOT NULL,
+  cached_at  INTEGER NOT NULL
+);
+SQL
+}
+
+# Try to read a cached response. Returns 0 on hit, 1 on miss.
+# On hit: writes body to BODY_FILE and sets HTTP_CODE.
+cache_get() {
+  (( USE_CACHE )) || return 1
+
+  local now
+  now="$(date +%s)"
+  local min_epoch=$(( now - CACHE_TTL_SECONDS ))
+
+  local row
+  row="$(sqlite3 -separator $'\t' "$CACHE_DB" \
+    "SELECT body, http_code FROM cache WHERE key = '${CACHE_KEY}' AND cached_at >= ${min_epoch} LIMIT 1;" 2>/dev/null)" || return 1
+
+  [[ -n "$row" ]] || return 1
+
+  BODY_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local cached_body cached_code
+  cached_code="${row##*$'\t'}"
+  cached_body="${row%$'\t'*}"
+
+  printf '%s' "$cached_body" > "$BODY_FILE"
+  HTTP_CODE="$cached_code"
+  return 0
+}
+
+# Store a response in the cache.
+cache_put() {
+  (( USE_CACHE )) || return 0
+
+  local body
+  body="$(cat "$BODY_FILE")"
+  local now
+  now="$(date +%s)"
+
+  # Use parameterised-style escaping: double single-quotes in body.
+  local escaped_body="${body//\'/\'\'}"
+
+  sqlite3 "$CACHE_DB" \
+    "INSERT OR REPLACE INTO cache (key, body, http_code, cached_at) VALUES ('${CACHE_KEY}', '${escaped_body}', '${HTTP_CODE}', ${now});" 2>/dev/null || true
+}
+
+# ── Auth ────────────────────────────────────────
+
+load_token() {
+  # Priority: AITOP_COPILOT_TOKEN > GITHUB_TOKEN > GITHUB_COPILOT_TOKEN > Keychain
+  if [[ -n "${AITOP_COPILOT_TOKEN:-}" ]]; then
+    printf '%s' "$AITOP_COPILOT_TOKEN"
+    return 0
+  fi
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf '%s' "$GITHUB_TOKEN"
+    return 0
+  fi
+
+  if [[ -n "${GITHUB_COPILOT_TOKEN:-}" ]]; then
+    printf '%s' "$GITHUB_COPILOT_TOKEN"
+    return 0
+  fi
+
+  # Try macOS Keychain
+  if command -v security >/dev/null 2>&1; then
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)" || true
+    if [[ -n "$token" ]]; then
+      printf '%s' "$token"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+validate_credentials() {
+  GITHUB_TOKEN="$(load_token)" || fail_stderr "$CRED_MISSING_MSG"
+
+  if [[ -z "$GITHUB_TOKEN" ]]; then
+    fail_stderr "$CRED_MISSING_MSG"
+  fi
+}
+
+# ── Fetch ───────────────────────────────────────
+
+fetch_usage() {
+  if cache_get; then
+    return
+  fi
+
+  BODY_FILE="$(mktemp)"
+  trap cleanup_files EXIT
+
+  local http_code
+  if ! http_code="$(curl -sS --max-time 20 -o "$BODY_FILE" -w '%{http_code}' "$USAGE_URL" \
+    -H "Authorization: token ${GITHUB_TOKEN}" \
+    -H 'Accept: application/json' \
+    -H 'Editor-Version: vscode/1.96.2' \
+    -H 'Editor-Plugin-Version: copilot-chat/0.26.7' \
+    -H 'User-Agent: GitHubCopilotChat/0.26.7' \
+    -H 'X-Github-Api-Version: 2025-04-01')"; then
+    fail_stderr "$NETWORK_ERR_MSG"
+  fi
+
+  HTTP_CODE="$http_code"
+
+  if [[ "$HTTP_CODE" == "200" ]]; then
+    cache_put
+  fi
+}
+
+json_value() {
+  local filter="$1"
+  jq -r "$filter // empty" "$BODY_FILE" 2>/dev/null || true
+}
+
+# ── Display ─────────────────────────────────────
+
+is_nonzero() {
+  local val="$1"
+  [[ -n "$val" && "$val" != "0" && "$val" != "0.0" ]]
+}
+
+# Convert remaining percent to used percent
+remaining_to_used() {
+  local remaining="$1"
+  if [[ -z "$remaining" || ! "$remaining" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    printf ''
+    return
+  fi
+  # remaining is 0-100, convert to used
+  local used
+  used="$(printf '%.1f' "$(echo "100 - $remaining" | bc -l 2>/dev/null || echo "0")")"
+  printf '%s' "$used"
+}
+
+# Calculate month elapsed percentage and seconds until reset
+# Args: quota_reset_date (YYYY-MM-DD)
+# Outputs: elapsed_pct reset_remaining_seconds month_seconds
+calc_month_progress() {
+  local reset_date="$1"
+  [[ -z "$reset_date" ]] && return 1
+  
+  local reset_epoch now_epoch month_start_epoch
+  local month_start_date month_days
+  
+  # Parse reset date (YYYY-MM-DD)
+  if [[ ! "$reset_date" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+    return 1
+  fi
+  
+  local reset_year="${BASH_REMATCH[1]}"
+  local reset_month="${BASH_REMATCH[2]}"
+  local reset_day="${BASH_REMATCH[3]}"
+  
+  # Calculate current month start (1st day of current month)
+  local current_year current_month
+  current_year="$(date +%Y)"
+  current_month="$(date +%m)"
+  month_start_date="${current_year}-${current_month}-01"
+  
+  # Get epoch times
+  reset_epoch="$(date -jf '%Y-%m-%d' "$reset_date" '+%s' 2>/dev/null)" || return 1
+  now_epoch="$(date +%s)"
+  month_start_epoch="$(date -jf '%Y-%m-%d' "$month_start_date" '+%s' 2>/dev/null)" || return 1
+  
+  # Calculate days in current month
+  month_days="$(date -jf '%Y-%m-%d' "${current_year}-${current_month}-01" '+%m' 2>/dev/null | \
+    xargs -I {} date -v+1m -v1d -v-1d -jf '%Y-%m-%d' "${current_year}-{}-01" '+%d' 2>/dev/null)"
+  [[ -z "$month_days" ]] && month_days=30
+  
+  month_seconds=$(( month_days * 86400 ))
+  
+  # Calculate elapsed since month start
+  local elapsed_seconds=$(( now_epoch - month_start_epoch ))
+  if (( elapsed_seconds < 0 )); then elapsed_seconds=0; fi
+  if (( elapsed_seconds > month_seconds )); then elapsed_seconds=$month_seconds; fi
+  
+  # Calculate elapsed percentage
+  local elapsed_pct=$(( elapsed_seconds * 100 / month_seconds ))
+  if (( elapsed_pct > 100 )); then elapsed_pct=100; fi
+  
+  # Calculate seconds until reset
+  local reset_remaining_seconds=$(( reset_epoch - now_epoch ))
+  if (( reset_remaining_seconds < 0 )); then reset_remaining_seconds=0; fi
+  
+  printf '%d %d %d' "$elapsed_pct" "$reset_remaining_seconds" "$month_seconds"
+}
+
+window_summary() {
+  local label="$1"
+  local used_pct="$2"
+  local elapsed_pct="${3:-}"
+  local reset_remaining="${4:-}"
+  local window_seconds="${5:-}"
+
+  [[ -n "$used_pct" ]] || return 0
+
+  render_window "$label" "$used_pct" "$elapsed_pct" "$reset_remaining" "$window_seconds"
+}
+
+print_usage_summary() {
+  local premium_remaining chat_remaining completions_remaining
+  local premium_used chat_used completions_used
+  local premium_unlimited chat_unlimited completions_unlimited
+  local plan_name quota_reset_date
+  local month_elapsed_pct reset_remaining month_seconds
+
+  premium_remaining="$(json_value '.quota_snapshots.premium_interactions.percent_remaining')"
+  chat_remaining="$(json_value '.quota_snapshots.chat.percent_remaining')"
+  completions_remaining="$(json_value '.quota_snapshots.completions.percent_remaining')"
+  premium_unlimited="$(json_value '.quota_snapshots.premium_interactions.unlimited')"
+  chat_unlimited="$(json_value '.quota_snapshots.chat.unlimited')"
+  completions_unlimited="$(json_value '.quota_snapshots.completions.unlimited')"
+  plan_name="$(json_value '.copilot_plan')"
+  quota_reset_date="$(json_value '.quota_reset_date')"
+
+  # Convert remaining to used (only for limited quotas)
+  if [[ "$premium_unlimited" != "true" ]]; then
+    premium_used="$(remaining_to_used "$premium_remaining")"
+  fi
+  if [[ "$chat_unlimited" != "true" ]]; then
+    chat_used="$(remaining_to_used "$chat_remaining")"
+  fi
+  if [[ "$completions_unlimited" != "true" ]]; then
+    completions_used="$(remaining_to_used "$completions_remaining")"
+  fi
+
+  if [[ -z "$premium_used" && -z "$chat_used" && -z "$completions_used" ]]; then
+    printf '%s\n' "$INVALID_USAGE_MSG"
+    return
+  fi
+
+  # Calculate month progress for time bar
+  if [[ -n "$quota_reset_date" ]]; then
+    local progress_data
+    progress_data="$(calc_month_progress "$quota_reset_date")"
+    if [[ -n "$progress_data" ]]; then
+      read -r month_elapsed_pct reset_remaining month_seconds <<<"$progress_data"
+    fi
+  fi
+
+  local subtitle=""
+  if [[ -n "$plan_name" && "$plan_name" != "unknown" ]]; then
+    subtitle="$plan_name"
+  fi
+  render_provider_header "Copilot" 110 120 255 "$subtitle"
+
+  local has_output=0
+
+  if [[ -n "$premium_used" ]]; then
+    window_summary "Premium" "$premium_used" "$month_elapsed_pct" "$reset_remaining" "$month_seconds"
+    has_output=1
+  fi
+
+  if [[ -n "$chat_used" ]]; then
+    if (( has_output )); then
+      printf '\n'
+    fi
+    window_summary "Chat" "$chat_used" "$month_elapsed_pct" "$reset_remaining" "$month_seconds"
+    has_output=1
+  fi
+
+  if [[ -n "$completions_used" ]]; then
+    if (( has_output )); then
+      printf '\n'
+    fi
+    window_summary "Completions" "$completions_used" "$month_elapsed_pct" "$reset_remaining" "$month_seconds"
+    has_output=1
+  fi
+}
+
+handle_response() {
+  case "$HTTP_CODE" in
+    200)
+      print_usage_summary
+      ;;
+    401|403)
+      fail_stderr "$AUTH_REJECTED_MSG"
+      ;;
+    404)
+      fail_stderr "GitHub Copilot API not found. Ensure Copilot is enabled for your account."
+      ;;
+    429)
+      fail_stderr "GitHub Copilot API rate limited. Try again in a few minutes."
+      ;;
+    *)
+      fail_stderr "GitHub Copilot usage fetch failed. Unexpected status: ${HTTP_CODE}."
+      ;;
+  esac
+}
+
+# ── Main ────────────────────────────────────────
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help)
+        usage
+        exit 0
+        ;;
+      --no-cache)
+        USE_CACHE=0
+        shift
+        ;;
+      --debug)
+        DEBUG=1
+        shift
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  setup_colors
+  init_cache
+  validate_credentials
+  fetch_usage
+  
+  if (( DEBUG )); then
+    printf 'HTTP Code: %s\n' "$HTTP_CODE" >&2
+    printf 'Response:\n' >&2
+    cat "$BODY_FILE" >&2
+    printf '\n' >&2
+  fi
+  
+  handle_response
+}
+
+main "$@"
